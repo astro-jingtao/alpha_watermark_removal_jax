@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 from jax.scipy.signal import convolve
 from jax import vmap
-from .kernel import gaussian_kernel, sobel_kernel
+from .kernel import gaussian_kernel, sobel_kernel, grad_kernel
 
 
 def convolve_with_kernel(image, kernel, boundary='reflect', method='auto'):
@@ -38,6 +38,10 @@ def gaussian(image, sigma, size, boundary='reflect'):
 def sobel(image, axis, boundary='reflect'):
     # https://docs.opencv.org/4.11.0/d2/d2c/tutorial_sobel_derivatives.html
     return convolve_with_kernel(image, sobel_kernel(axis), boundary=boundary)
+
+
+def grad(image, axis, boundary='reflect'):
+    return convolve_with_kernel(image, grad_kernel(axis), boundary=boundary)
 
 
 # def canny(img, low_thresh=50, high_thresh=100, sigma=1.0):

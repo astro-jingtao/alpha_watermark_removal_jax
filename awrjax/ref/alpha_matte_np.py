@@ -1,6 +1,3 @@
-# taken form https://github.com/rohitrango/automatic-watermark-detection/blob/master/src/closed_form_matting.py
-# to test if jax version is correct
-
 from __future__ import division
 
 import numpy as np
@@ -55,20 +52,19 @@ def computeLaplacian(img, eps=10**(-7), win_rad=1):
     return L
 
 
-def closed_form_matte(img, scribbled_img, mylambda=100):
+def closed_form_matte(img, prior, prior_confidence):
     h, w, c = img.shape
-    consts_map = (np.sum(abs(img - scribbled_img), axis=-1)
-                  > 0.001).astype(np.float64)
-
-    consts_vals = scribbled_img[:, :, 0] * consts_map
-    D_s = consts_map.ravel()
-    b_s = consts_vals.ravel()
     # print("Computing Matting Laplacian")
     L = computeLaplacian(img)
 
-    sD_s = scipy.sparse.diags(D_s)
+    confidence = scipy.sparse.diags(prior_confidence.ravel())
     # print("Solving for alpha")
-    # return L + mylambda * sD_s, mylambda * b_s
-    x = spsolve(L + mylambda * sD_s, mylambda * b_s)
+    x = spsolve(L + confidence, prior_confidence.ravel() * prior.ravel())
     alpha = np.clip(x.reshape(h, w), 0, 1)
     return alpha
+
+
+def closed_form_matte_prepare(img, prior, prior_confidence):
+    L = computeLaplacian(img)
+    confidence = scipy.sparse.diags(prior_confidence.ravel())
+    return L + confidence, prior_confidence.ravel() * prior.ravel()

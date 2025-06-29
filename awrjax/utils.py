@@ -5,8 +5,9 @@ import jax.numpy as jnp
 from ait.utils import read_img
 
 
-def normalize_img(img):
-    return (img - jnp.min(img)) / (jnp.max(img) - jnp.min(img))
+def normalize_img(img, axis=None):
+    return (img - jnp.min(img, axis=axis)) / (jnp.max(img, axis=axis) -
+                                              jnp.min(img, axis=axis))
 
 
 def binarize_img(img, threshold=0.5):
@@ -34,6 +35,11 @@ def spdiag(x):
     return sparse.BCOO((x, jnp.c_[jnp.arange(n), jnp.arange(n)]), shape=(n, n))
 
 
+def COO_spsolve(A, b):
+    data, cols, indptr = COO_to_CSR_info(A)
+    return sparse.linalg.spsolve(data, cols, indptr, b)
+
+
 def COO_to_CSR_info(X):
     # Sort COO data by row and then column
     data = X.data
@@ -55,5 +61,3 @@ def COO_to_CSR_info(X):
          jnp.cumsum(row_counts)])
 
     return sorted_data, sorted_cols, indptr
-
-

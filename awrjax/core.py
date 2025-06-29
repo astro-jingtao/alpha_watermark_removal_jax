@@ -3,11 +3,16 @@ from jax import jit
 from jax import Array
 import numpy as np
 import cv2
+# from jax.experimental import sparse
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse import vstack as sp_vstack
+from scipy.sparse import hstack as sp_hstack
+from scipy.sparse.linalg import spsolve
 
 from tqdm import tqdm
 
-from .jaxcv.filter import sobel, convolve_with_kernel
-from .utils import binarize_img, normalize_img
+from .jaxcv.filter import sobel, convolve_with_kernel, grad
+from .utils import binarize_img, normalize_img, spdiag, COO_spsolve
 # jax version can not work, let's use numpy version
 from .ref.alpha_matte_np import closed_form_matte
 
@@ -178,11 +183,15 @@ def detect_watermark(img,
     return i, j, rect[0], rect[1]
 
 
-def estimate_normalized_alpha(J, Wm, threshold=0.5):
-    Wm = binarize_img(normalize_img(np.average(Wm, axis=-1)),
-                      threshold=threshold)
-    Wm = (Wm * 255).astype(np.uint8)
-    Wm = np.stack([np.asarray(Wm)] * 3, axis=-1)
+def estimate_normalized_alpha(J,
+                              Wm,
+                              _lambda=100,
+                              threshold=0.7,
+                              std_wm_thresh=0.2,
+                              std_bg_thresh=0.4):
+
+    prior, prior_confidence = get_matte_prior(J, Wm, _lambda, threshold,
+                                              std_wm_thresh, std_bg_thresh)
 
     num = len(J)
     alpha_lst = []
@@ -190,8 +199,303 @@ def estimate_normalized_alpha(J, Wm, threshold=0.5):
     print(f"Estimating normalized alpha using {num} images.")
     # for all images, calculate alpha
     for idx in tqdm(range(num)):
-        alpha = closed_form_matte(np.asarray(J[idx]), Wm)
+        alpha = closed_form_matte(
+            np.asarray(J[idx]),
+            prior=np.asarray(prior),
+            prior_confidence=np.asarray(prior_confidence))
         alpha_lst.append(alpha)
 
     alpha = np.median(alpha_lst, axis=0)
     return jnp.asarray(alpha)
+
+
+def get_matte_prior(J, Wm, _lambda, threshold, std_wm_thresh, std_bg_thresh):
+    Wm = binarize_img(jnp.mean(normalize_img(Wm, axis=(0, 1)), axis=-1),
+                      threshold=threshold)
+    std_map = normalize_img(jnp.std(jnp.asarray(J), axis=0).mean(axis=-1))
+    is_watermark = (std_map < std_wm_thresh) | (Wm == 1)
+    is_background = (std_map > std_bg_thresh) & (Wm == 0)
+
+    prior = is_watermark.astype(np.float64)
+    prior_confidence = np.ones_like(prior) * _lambda
+    prior_confidence[~is_watermark & ~is_background] = 0
+    return prior, prior_confidence
+
+
+def estimate_blend_factor(J, Wm, alpha_norm):
+    J = jnp.asarray(J)
+    K, m, n, p = J.shape
+    Jm = (J - Wm)
+    gx_jm = []
+    gy_jm = []
+
+    for i in range(K):
+        gx_jm.append(sobel(Jm[i], axis='x'))
+        gy_jm.append(sobel(Jm[i], axis='y'))
+
+    gx_jm = jnp.array(gx_jm)
+    gy_jm = jnp.array(gy_jm)
+
+    Jm_grad = jnp.sqrt(gx_jm**2 + gy_jm**2)
+
+    est_Ik = alpha_norm[..., jnp.newaxis] * jnp.median(J, axis=0)
+    # est_Ik = jnp.median(J, axis=0)
+    gx_estIk = sobel(est_Ik, axis='x')
+    gy_estIk = sobel(est_Ik, axis='y')
+    estIk_grad = np.sqrt(gx_estIk**2 + gy_estIk**2)
+
+    C = []
+    for i in range(3):
+        c_i = jnp.sum(Jm_grad[:, :, :, i] * estIk_grad[:, :, i]) / jnp.sum(
+            jnp.square(estIk_grad[:, :, i])) / K
+        C.append(c_i)
+
+    return C, est_Ik
+
+
+# def estimate_blend_factor(J, Wm, alpha_norm):
+#     J = jnp.asarray(J)
+#     K, m, n, p = J.shape
+#     Jm = (J - Wm)
+
+#     est_Ik = jnp.median(Jm, axis=0)
+
+#     return C, est_Ik
+
+
+def solve_images_jax(J,
+                     Wm,
+                     alpha,
+                     W_init,
+                     gamma=1,
+                     beta=1,
+                     lambda_w=0.005,
+                     lambda_i=1,
+                     lambda_a=0.01,
+                     iters=4):
+    '''
+    Master solver, follows the algorithm given in the supplementary.
+    W_init: Initial value of W
+    Step 1: Image Watermark decomposition
+    '''
+    # prepare variables
+    J = np.asarray(J)
+    K, m, n, p = J.shape
+    size = m * n * p
+
+    sobelx = get_xSobel_matrix(m, n, p)
+    sobely = get_ySobel_matrix(m, n, p)
+    Ik = []
+    Wk = []
+    for i in range(K):
+        Ik.append(J[i] - Wm)
+        Wk.append(W_init.copy())
+
+    # This is for median images
+    W = W_init.copy()
+
+    Wm_old = Wm.copy()
+
+    Wm_gx = sobel(Wm, axis='x')
+    Wm_gy = sobel(Wm, axis='y')
+
+    # Iterations
+    for ii in range(iters):
+
+        print("------------------------------------")
+        print(f"Iteration:{ii}")
+
+        # Step 1
+        print("Step 1")
+        alpha_gx = sobel(alpha, axis='x')
+        alpha_gy = sobel(alpha, axis='y')
+
+        
+
+        cx = diags(np.abs(alpha_gx).flatten())
+        cy = diags(np.abs(alpha_gy).flatten())
+
+        alpha_diag = diags(alpha.flatten())
+        alpha_bar_diag = diags((1 - alpha).flatten())
+
+        for i in range(K):
+            # prep vars
+            Wkx = sobel(Wk[i], axis='x')
+            Wky = sobel(Wk[i], axis='y')
+
+            Ikx = sobel(Ik[i], axis='x')
+            Iky = sobel(Ik[i], axis='y')
+
+            alphaWk = alpha * Wk[i]
+            alphaWk_gx = sobel(alphaWk, axis='x')
+            alphaWk_gy = sobel(alphaWk, axis='y')
+
+            phi_data = diags(
+                func_phi_deriv(
+                    np.square(alpha * Wk[i] + (1 - alpha) * Ik[i] -
+                              J[i]).reshape(-1)))
+            phi_f = diags(
+                func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
+                                (Wm_gy - alphaWk_gy)**2).reshape(-1)))
+            phi_aux = diags(func_phi_deriv(np.square(Wk[i] - W).reshape(-1)))
+            phi_rI = diags(
+                func_phi_deriv(
+                    np.abs(alpha_gx) * (Ikx**2) + np.abs(alpha_gy) *
+                    (Iky**2)).reshape(-1))
+            phi_rW = diags(
+                func_phi_deriv(
+                    np.abs(alpha_gx) * (Wkx**2) + np.abs(alpha_gy) *
+                    (Wky**2)).reshape(-1))
+
+            L_i = sobelx.T @ (cx * phi_rI) @ (sobelx) + sobely.T @ (
+                cy * phi_rI) @ (sobely)
+            L_w = sobelx.T @ (cx * phi_rW) @ (sobelx) + sobely.T @ (
+                cy * phi_rW) @ (sobely)
+            L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
+            A_f = alpha_diag.T @ (L_f) @ (alpha_diag) + gamma * phi_aux
+
+            bW = alpha_diag @ (phi_data) @ (J[i].reshape(-1)) + beta * L_f @ (
+                Wm.reshape(-1)) + gamma * phi_aux @ (W.reshape(-1))
+            bI = alpha_bar_diag @ (phi_data) @ (J[i].reshape(-1))
+
+            A = sp_vstack([sp_hstack([(alpha_diag**2)*phi_data + lambda_w*L_w + beta*A_f, alpha_diag*alpha_bar_diag*phi_data]), \
+                         sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data + lambda_i*L_i])]).tocsr()
+
+            b = np.hstack([bW, bI])
+            # return A, b
+            x = spsolve(A, b)
+
+            Wk[i] = np.clip(x[:size].reshape(m, n, p), 0, 255)
+            Ik[i] = np.clip(x[size:].reshape(m, n, p), 0, 255)
+
+            print(i)
+
+        # Step 2
+        print("Step 2")
+        W = np.median(np.asarray(Wk), axis=0)
+
+        # Step 3
+        print("Step 3")
+        W_diag = diags(W.reshape(-1))
+
+        for i in range(K):
+            alphaWk = alpha * Wk[i]
+            alphaWk_gx = sobel(alphaWk, axis='x')
+            alphaWk_gy = sobel(alphaWk, axis='y')
+            phi_f = diags(
+                func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
+                                (Wm_gy - alphaWk_gy)**2).reshape(-1)))
+
+            phi_kA = diags(((func_phi_deriv(
+                (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
+                            ((W - Ik[i])**2)).reshape(-1))
+            phi_kB = (((func_phi_deriv(
+                (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
+                       (W - Ik[i]) * (J[i] - Ik[i])).reshape(-1))
+
+            phi_alpha = diags(
+                func_phi_deriv(alpha_gx**2 + alpha_gy**2).reshape(-1))
+            L_alpha = sobelx.T @ (phi_alpha @ (sobelx)) + sobely.T @ (
+                phi_alpha @ (sobely))
+
+            L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
+            A_tilde_f = W_diag.T @ (L_f) @ (W_diag)
+            # Ax = b, setting up A
+            if i == 0:
+                A1 = phi_kA + lambda_a * L_alpha + beta * A_tilde_f
+                b1 = phi_kB + beta * W_diag @ (L_f) @ (Wm.reshape(-1))
+            else:
+                A1 += (phi_kA + lambda_a * L_alpha + beta * A_tilde_f)
+                b1 += (phi_kB + beta * W_diag.T @ (L_f) @ (Wm.reshape(-1)))
+
+        alpha = spsolve(A1, b1).reshape(m, n, p)
+        alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0,
+                        1)
+        Wm = alpha * W
+        print(np.linalg.norm(Wm - Wm_old))
+        Wm_old = Wm.copy()
+
+    return (Wk, Ik, W, alpha)
+
+
+def func_phi(X, epsilon=1e-3):
+    return np.sqrt(X + epsilon**2)
+
+
+def func_phi_deriv(X, epsilon=1e-3):
+    return 0.5 / func_phi(X, epsilon)
+
+
+# get sobel coordinates for y
+def _get_ysobel_coord(coord, shape):
+    i, j, k = coord
+    m, n, p = shape
+    # return [(i - 1, j, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
+    #         (i + 1, j, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
+    return [(i - 1, j, k, -1), (i + 1, j, k, 1)]
+
+
+# get sobel coordinates for x
+def _get_xsobel_coord(coord, shape):
+    i, j, k = coord
+    m, n, p = shape
+    # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
+    #         (i, j + 1, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
+    return [(i, j - 1, k, -1), (i, j + 1, k, 1)]
+
+
+# filter
+def _filter_list_item(coord, shape):
+    i, j, k, v = coord
+    m, n, p = shape
+    if i >= 0 and i < m and j >= 0 and j < n:
+        return True
+
+
+# Change to ravel index
+# also filters the wrong guys
+def _change_to_ravel_index(li, shape):
+    li = filter(lambda x: _filter_list_item(x, shape), li)
+    i, j, k, v = zip(*li)
+    return zip(np.ravel_multi_index((i, j, k), shape), v)
+
+
+def get_ySobel_matrix(m, n, p):
+    size = m * n * p
+    shape = (m, n, p)
+    i, j, k = np.unravel_index(np.arange(size), (m, n, p))
+    ijk = zip(list(i), list(j), list(k))
+    ijk_nbrs = map(lambda x: _get_ysobel_coord(x, shape), ijk)
+    ijk_nbrs_to_index = map(lambda l: _change_to_ravel_index(l, shape),
+                            ijk_nbrs)
+    # we get a list of idx, values for a particular idx
+    # we have got the complete list now, map it to actual index
+    actual_map = []
+    for i, list_of_coords in enumerate(ijk_nbrs_to_index):
+        for coord in list_of_coords:
+            actual_map.append((i, coord[0], coord[1]))
+
+    i, j, vals = zip(*actual_map)
+    # return sparse.BCOO((jnp.asarray(vals), jnp.c_[i, j]), shape=(size, size))
+    return coo_matrix((vals, (i, j)), shape=(size, size))
+
+
+# get Sobel sparse matrix for X
+def get_xSobel_matrix(m, n, p):
+    size = m * n * p
+    shape = (m, n, p)
+    i, j, k = np.unravel_index(np.arange(size), (m, n, p))
+    ijk = zip(list(i), list(j), list(k))
+    ijk_nbrs = map(lambda x: _get_xsobel_coord(x, shape), ijk)
+    ijk_nbrs_to_index = map(lambda l: _change_to_ravel_index(l, shape),
+                            ijk_nbrs)
+    # we get a list of idx, values for a particular idx
+    # we have got the complete list now, map it to actual index
+    actual_map = []
+    for i, list_of_coords in enumerate(ijk_nbrs_to_index):
+        for coord in list_of_coords:
+            actual_map.append((i, coord[0], coord[1]))
+
+    i, j, vals = zip(*actual_map)
+    # return sparse.BCOO((jnp.asarray(vals), jnp.c_[i, j]), shape=(size, size))
+    return coo_matrix((vals, (i, j)), shape=(size, size))

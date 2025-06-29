@@ -31,3 +31,17 @@ def sobel_kernel(axis):
         raise ValueError("Invalid axis for Sobel kernel")
 
     return kernel
+
+def grad_kernel(axis):
+
+    """
+    Returns a Gradient kernel of given size.
+    """
+    if axis in (0, 'y', 'i'):
+        kernel = jnp.array([[0, 1, 0], [0, 0, 0], [0, -1, 0]])
+    elif axis in (1, 'x', 'j'):
+        kernel = jnp.array([[0, 0, 0], [1, 0, -1], [0, 0, 0]])
+    else:
+        raise ValueError("Invalid axis for Gradient kernel")
+
+    return kernel

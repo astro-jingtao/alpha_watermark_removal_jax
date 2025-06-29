@@ -1,6 +1,9 @@
-from .core import estimate_watermark, poisson_reconstruct, crop_watermark, detect_watermark, box_watermark
-from .utils import load_imgs
 import jax.numpy as jnp
+
+from .core import (box_watermark, crop_watermark, detect_watermark,
+                   estimate_normalized_alpha, estimate_watermark,
+                   poisson_reconstruct)
+from .utils import load_imgs
 
 J = load_imgs(
     '/home/jingtao/software/workspace/myrepos/alpha_watermark_removal_jax/data/awr_test'
@@ -20,5 +23,8 @@ i_min, i_max, j_min, j_max = box_watermark(gx, gy)
 
 J_crop = [j[i_min:i_max, j_min:j_max, :] for j in J]
 
+alpha_norm_est = estimate_normalized_alpha(J_crop, Wm)
 
-alph_est = estimate_normalized_alpha(J_crop, Wm)
+Wm_pos = Wm - Wm.min()
+
+C, est_Ik = estimate_blend_factor(J, Wm_pos, alpha_norm_est)
