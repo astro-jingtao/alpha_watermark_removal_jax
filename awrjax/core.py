@@ -272,7 +272,9 @@ def solve_images_jax(J,
                      lambda_w=0.005,
                      lambda_i=1,
                      lambda_a=0.01,
-                     iters=4):
+                     iters=4,
+                     decompose_iters=3,
+                     alpha_inters=3):
     '''
     Master solver, follows the algorithm given in the supplementary.
     W_init: Initial value of W
@@ -281,7 +283,6 @@ def solve_images_jax(J,
     # prepare variables
     J = np.asarray(J)
     K, m, n, p = J.shape
-    size = m * n * p
 
     sobelx = get_xSobel_matrix(m, n, p)
     sobely = get_ySobel_matrix(m, n, p)
@@ -295,6 +296,7 @@ def solve_images_jax(J,
     W = W_init.copy()
 
     Wm_old = Wm.copy()
+    # alpha_old = alpha.copy()
 
     Wm_gx = sobel(Wm, axis='x')
     Wm_gy = sobel(Wm, axis='y')
@@ -307,68 +309,44 @@ def solve_images_jax(J,
 
         # Step 1
         print("Step 1")
-        alpha_gx = sobel(alpha, axis='x')
-        alpha_gy = sobel(alpha, axis='y')
+        alpha_gx_abs = np.abs(sobel(alpha, axis='x'))
+        alpha_gy_abs = np.abs(sobel(alpha, axis='y'))
 
-        
-
-        cx = diags(np.abs(alpha_gx).flatten())
-        cy = diags(np.abs(alpha_gy).flatten())
+        cx = diags(alpha_gx_abs.flatten())
+        cy = diags(alpha_gy_abs.flatten())
 
         alpha_diag = diags(alpha.flatten())
         alpha_bar_diag = diags((1 - alpha).flatten())
 
         for i in range(K):
-            # prep vars
-            Wkx = sobel(Wk[i], axis='x')
-            Wky = sobel(Wk[i], axis='y')
 
-            Ikx = sobel(Ik[i], axis='x')
-            Iky = sobel(Ik[i], axis='y')
-
-            alphaWk = alpha * Wk[i]
-            alphaWk_gx = sobel(alphaWk, axis='x')
-            alphaWk_gy = sobel(alphaWk, axis='y')
-
-            phi_data = diags(
-                func_phi_deriv(
-                    np.square(alpha * Wk[i] + (1 - alpha) * Ik[i] -
-                              J[i]).reshape(-1)))
-            phi_f = diags(
-                func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
-                                (Wm_gy - alphaWk_gy)**2).reshape(-1)))
-            phi_aux = diags(func_phi_deriv(np.square(Wk[i] - W).reshape(-1)))
-            phi_rI = diags(
-                func_phi_deriv(
-                    np.abs(alpha_gx) * (Ikx**2) + np.abs(alpha_gy) *
-                    (Iky**2)).reshape(-1))
-            phi_rW = diags(
-                func_phi_deriv(
-                    np.abs(alpha_gx) * (Wkx**2) + np.abs(alpha_gy) *
-                    (Wky**2)).reshape(-1))
-
-            L_i = sobelx.T @ (cx * phi_rI) @ (sobelx) + sobely.T @ (
-                cy * phi_rI) @ (sobely)
-            L_w = sobelx.T @ (cx * phi_rW) @ (sobelx) + sobely.T @ (
-                cy * phi_rW) @ (sobely)
-            L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
-            A_f = alpha_diag.T @ (L_f) @ (alpha_diag) + gamma * phi_aux
-
-            bW = alpha_diag @ (phi_data) @ (J[i].reshape(-1)) + beta * L_f @ (
-                Wm.reshape(-1)) + gamma * phi_aux @ (W.reshape(-1))
-            bI = alpha_bar_diag @ (phi_data) @ (J[i].reshape(-1))
-
-            A = sp_vstack([sp_hstack([(alpha_diag**2)*phi_data + lambda_w*L_w + beta*A_f, alpha_diag*alpha_bar_diag*phi_data]), \
-                         sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data + lambda_i*L_i])]).tocsr()
-
-            b = np.hstack([bW, bI])
-            # return A, b
-            x = spsolve(A, b)
-
-            Wk[i] = np.clip(x[:size].reshape(m, n, p), 0, 255)
-            Ik[i] = np.clip(x[size:].reshape(m, n, p), 0, 255)
-
-            print(i)
+            Wk[i], Ik[i] = decompose_wartermark_image(
+                J_i=J[i],
+                Wk_i=Wk[i],
+                Ik_i=Ik[i],
+                alpha=alpha,
+                alpha_gx_abs=alpha_gx_abs,
+                alpha_gy_abs=alpha_gy_abs,
+                alpha_diag=alpha_diag,
+                alpha_bar_diag=alpha_bar_diag,
+                Wm=Wm,
+                Wm_gx=Wm_gx,
+                Wm_gy=Wm_gy,
+                W=W,
+                sobelx=sobelx,
+                sobely=sobely,
+                cx=cx,
+                cy=cy,
+                gamma=gamma,
+                beta=beta,
+                lambda_w=lambda_w,
+                lambda_i=lambda_i,
+                m=m,
+                n=n,
+                p=p,
+                decompose_iters=decompose_iters)
+            
+            print(f"Image {i+1}/{K} decomposed.")
 
         # Step 2
         print("Step 2")
@@ -378,44 +356,77 @@ def solve_images_jax(J,
         print("Step 3")
         W_diag = diags(W.reshape(-1))
 
-        for i in range(K):
-            alphaWk = alpha * Wk[i]
-            alphaWk_gx = sobel(alphaWk, axis='x')
-            alphaWk_gy = sobel(alphaWk, axis='y')
-            phi_f = diags(
-                func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
-                                (Wm_gy - alphaWk_gy)**2).reshape(-1)))
+        for j in range(alpha_inters):
 
-            phi_kA = diags(((func_phi_deriv(
-                (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
-                            ((W - Ik[i])**2)).reshape(-1))
-            phi_kB = (((func_phi_deriv(
-                (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
-                       (W - Ik[i]) * (J[i] - Ik[i])).reshape(-1))
+            alpha = update_alpha(J=J,
+                                 Wk=Wk,
+                                 Ik=Ik,
+                                 W=W,
+                                 W_diag=W_diag,
+                                 Wm_gx=Wm_gx,
+                                 Wm_gy=Wm_gy,
+                                 Wm=Wm,
+                                 alpha=alpha,
+                                 alpha_gx_abs=alpha_gx_abs,
+                                 alpha_gy_abs=alpha_gy_abs,
+                                 sobelx=sobelx,
+                                 sobely=sobely,
+                                 beta=beta,
+                                 lambda_a=lambda_a,
+                                 K=K,
+                                 m=m,
+                                 n=n,
+                                 p=p)
 
-            phi_alpha = diags(
-                func_phi_deriv(alpha_gx**2 + alpha_gy**2).reshape(-1))
-            L_alpha = sobelx.T @ (phi_alpha @ (sobelx)) + sobely.T @ (
-                phi_alpha @ (sobely))
+            print(f"alpha_inters: {j+1}/{alpha_inters}")
 
-            L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
-            A_tilde_f = W_diag.T @ (L_f) @ (W_diag)
-            # Ax = b, setting up A
-            if i == 0:
-                A1 = phi_kA + lambda_a * L_alpha + beta * A_tilde_f
-                b1 = phi_kB + beta * W_diag @ (L_f) @ (Wm.reshape(-1))
-            else:
-                A1 += (phi_kA + lambda_a * L_alpha + beta * A_tilde_f)
-                b1 += (phi_kB + beta * W_diag.T @ (L_f) @ (Wm.reshape(-1)))
+        # print(np.linalg.norm(alpha - alpha_old))
+        # alpha_old = alpha.copy()
 
-        alpha = spsolve(A1, b1).reshape(m, n, p)
-        alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0,
-                        1)
         Wm = alpha * W
         print(np.linalg.norm(Wm - Wm_old))
         Wm_old = Wm.copy()
 
     return (Wk, Ik, W, alpha)
+
+
+def update_alpha(J, Wk, Ik, W, W_diag, Wm_gx, Wm_gy, Wm, alpha, alpha_gx_abs,
+                 alpha_gy_abs, sobelx, sobely, beta, lambda_a, K, m, n, p):
+
+    for i in range(K):
+        alphaWk = alpha * Wk[i]
+        alphaWk_gx = sobel(alphaWk, axis='x')
+        alphaWk_gy = sobel(alphaWk, axis='y')
+        phi_f = diags(
+            func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
+                            (Wm_gy - alphaWk_gy)**2).reshape(-1)))
+
+        phi_kA = diags(((func_phi_deriv(
+            (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
+                        ((W - Ik[i])**2)).reshape(-1))
+        phi_kB = (((func_phi_deriv(
+            (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
+                   (W - Ik[i]) * (J[i] - Ik[i])).reshape(-1))
+
+        phi_alpha = diags(
+            func_phi_deriv(alpha_gx_abs**2 + alpha_gy_abs**2).reshape(-1))
+        L_alpha = sobelx.T @ (phi_alpha @ (sobelx)) + sobely.T @ (
+            phi_alpha @ (sobely))
+
+        L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
+        A_tilde_f = W_diag.T @ (L_f) @ (W_diag)
+        # Ax = b, setting up A
+        if i == 0:
+            A1 = phi_kA + lambda_a * L_alpha + beta * A_tilde_f
+            b1 = phi_kB + beta * W_diag @ (L_f) @ (Wm.reshape(-1))
+        else:
+            A1 += (phi_kA + lambda_a * L_alpha + beta * A_tilde_f)
+            b1 += (phi_kB + beta * W_diag.T @ (L_f) @ (Wm.reshape(-1)))
+
+    alpha = spsolve(A1, b1).reshape(m, n, p)
+    # alpha = np.clip(alpha, 0, 1)
+    alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0, 1)
+    return alpha
 
 
 def func_phi(X, epsilon=1e-3):
@@ -499,3 +510,118 @@ def get_xSobel_matrix(m, n, p):
     i, j, vals = zip(*actual_map)
     # return sparse.BCOO((jnp.asarray(vals), jnp.c_[i, j]), shape=(size, size))
     return coo_matrix((vals, (i, j)), shape=(size, size))
+
+
+def decompose_wartermark_image(J_i,
+                               Wk_i,
+                               Ik_i,
+                               alpha,
+                               alpha_gx_abs,
+                               alpha_gy_abs,
+                               alpha_diag,
+                               alpha_bar_diag,
+                               Wm,
+                               Wm_gx,
+                               Wm_gy,
+                               W,
+                               sobelx,
+                               sobely,
+                               cx,
+                               cy,
+                               gamma,
+                               beta,
+                               lambda_w,
+                               lambda_i,
+                               m,
+                               n,
+                               p,
+                               decompose_iters,
+                               verbose=False):
+
+    for j in range(decompose_iters):
+
+        Wk_i, Ik_i = _decompose_wartermark_image_single(
+            J_i=J_i,
+            Wk_i=Wk_i,
+            Ik_i=Ik_i,
+            alpha=alpha,
+            alpha_gx_abs=alpha_gx_abs,
+            alpha_gy_abs=alpha_gy_abs,
+            alpha_diag=alpha_diag,
+            alpha_bar_diag=alpha_bar_diag,
+            Wm=Wm,
+            Wm_gx=Wm_gx,
+            Wm_gy=Wm_gy,
+            W=W,
+            sobelx=sobelx,
+            sobely=sobely,
+            cx=cx,
+            cy=cy,
+            gamma=gamma,
+            beta=beta,
+            lambda_w=lambda_w,
+            lambda_i=lambda_i,
+            m=m,
+            n=n,
+            p=p)
+
+        if verbose:
+            print(f"{j+1}/{decompose_iters}")
+
+    return Wk_i, Ik_i
+
+
+def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
+                                       alpha_gy_abs, alpha_diag,
+                                       alpha_bar_diag, Wm, Wm_gx, Wm_gy, W,
+                                       sobelx, sobely, cx, cy, gamma, beta,
+                                       lambda_w, lambda_i, m, n, p):
+
+    size = m * n * p
+
+    Wkx = sobel(Wk_i, axis='x')
+    Wky = sobel(Wk_i, axis='y')
+
+    Ikx = sobel(Ik_i, axis='x')
+    Iky = sobel(Ik_i, axis='y')
+
+    alphaWk = alpha * Wk_i
+    alphaWk_gx = sobel(alphaWk, axis='x')
+    alphaWk_gy = sobel(alphaWk, axis='y')
+
+    phi_data = diags(
+        func_phi_deriv(
+            np.square(alpha * Wk_i + (1 - alpha) * Ik_i - J_i).flatten()))
+    phi_f = diags(
+        func_phi_deriv(
+            ((Wm_gx - alphaWk_gx)**2 + (Wm_gy - alphaWk_gy)**2).flatten()))
+    phi_aux = diags(func_phi_deriv(np.square(Wk_i - W).flatten()))
+    phi_rI = diags(
+        func_phi_deriv(alpha_gx_abs * (Ikx**2) + alpha_gy_abs *
+                       (Iky**2)).flatten())
+    phi_rW = diags(
+        func_phi_deriv(alpha_gx_abs * (Wkx**2) + alpha_gy_abs *
+                       (Wky**2)).flatten())
+
+    L_i = sobelx.T @ (cx * phi_rI) @ (sobelx) + sobely.T @ (cy *
+                                                            phi_rI) @ (sobely)
+    L_w = sobelx.T @ (cx * phi_rW) @ (sobelx) + sobely.T @ (cy *
+                                                            phi_rW) @ (sobely)
+    L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
+    A_f = alpha_diag.T @ (L_f) @ (alpha_diag) + gamma * phi_aux
+
+    bW = alpha_diag @ (phi_data) @ (J_i.flatten()) + beta * L_f @ (
+        Wm.flatten()) + gamma * phi_aux @ (W.flatten())
+    bI = alpha_bar_diag @ (phi_data) @ (J_i.flatten())
+
+    A = sp_vstack([sp_hstack([(alpha_diag**2)*phi_data + lambda_w*L_w + beta*A_f, alpha_diag*alpha_bar_diag*phi_data]), \
+                    sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data + lambda_i*L_i])]).tocsr()
+
+    b = np.hstack([bW, bI])
+    # return A, b
+    x = spsolve(A, b)
+
+    Wk_i_new = np.clip(x[:size].reshape(m, n, p), 0, 255)  # type: ignore
+    Ik_i_new = np.clip(x[size:].reshape(m, n, p), 0, 255)  # type: ignore
+
+    return Wk_i_new, Ik_i_new
