@@ -386,8 +386,11 @@ def solve_images_jax(
                 p=p,
                 alpha_max=alpha_max)
 
+            
+
             rdiff_alpha = np.linalg.norm(
                 alpha - step3_alpha_old) / np.linalg.norm(alpha)
+            # print(rdiff_alpha)
             step3_alpha_old = alpha.copy()
 
             if first_rdiff is None:
@@ -460,40 +463,44 @@ def update_alpha(
     alpha_gx_abs = np.abs(grad_operator(alpha, axis='x'))
     alpha_gy_abs = np.abs(grad_operator(alpha, axis='y'))
 
+    alphaWk = alpha * W
+    alphaWk_gx = grad_operator(alphaWk, axis='x')
+    alphaWk_gy = grad_operator(alphaWk, axis='y')
+    
+
+    phi_alpha = diags(
+        func_phi_deriv(alpha_gx_abs**2 + alpha_gy_abs**2).reshape(-1))
+
+    L_alpha = sobelx.T @ (phi_alpha @ (sobelx)) + sobely.T @ (
+        phi_alpha @ (sobely))
+
+    phi_f = diags(
+        func_phi_deriv(
+            ((Wm_gx - alphaWk_gx)**2 + (Wm_gy - alphaWk_gy)**2).reshape(-1)))
+    L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
+    A_tilde_f = W_diag.T @ (L_f) @ (W_diag)
+    
+
+    A1 = lambda_a * L_alpha + beta * A_tilde_f
+    b1 = beta * W_diag @ (L_f) @ (Wm.reshape(-1))
+
     for i in range(K):
-        alphaWk = alpha * Wk[i]
-        alphaWk_gx = grad_operator(alphaWk, axis='x')
-        alphaWk_gy = grad_operator(alphaWk, axis='y')
-        phi_f = diags(
-            func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
-                            (Wm_gy - alphaWk_gy)**2).reshape(-1)))
 
-        phi_kA = diags(((func_phi_deriv(
-            (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
-                        ((W - Ik[i])**2)).reshape(-1))
-        phi_kB = (((func_phi_deriv(
-            (((alpha * Wk[i] + (1 - alpha) * Ik[i] - J[i])**2)))) *
-                   (W - Ik[i]) * (J[i] - Ik[i])).reshape(-1))
+        # paper use W, while original code use Wk[i] 
+        A_k = func_phi_deriv(
+            (alpha * W + (1 - alpha) * Ik[i] - J[i])**2) * (W - Ik[i])
 
-        phi_alpha = diags(
-            func_phi_deriv(alpha_gx_abs**2 + alpha_gy_abs**2).reshape(-1))
-        L_alpha = sobelx.T @ (phi_alpha @ (sobelx)) + sobely.T @ (
-            phi_alpha @ (sobely))
+        phi_kA = diags((A_k * (W - Ik[i])).reshape(-1))
+        phi_kB = (A_k * (J[i] - Ik[i])).reshape(-1)
 
-        L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
-        A_tilde_f = W_diag.T @ (L_f) @ (W_diag)
-        # Ax = b, setting up A
-        if i == 0:
-            A1 = phi_kA + lambda_a * L_alpha + beta * A_tilde_f
-            b1 = phi_kB + beta * W_diag @ (L_f) @ (Wm.reshape(-1))
-        else:
-            A1 += (phi_kA + lambda_a * L_alpha + beta * A_tilde_f)
-            b1 += (phi_kB + beta * W_diag.T @ (L_f) @ (Wm.reshape(-1)))
+        A1 += phi_kA
+        b1 += phi_kB
 
     alpha = spsolve(A1, b1).reshape(m, n, p)
-    # alpha = np.clip(alpha, 0, 1)
-    alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0,
-                    alpha_max)
+    alpha = np.clip(alpha, 0, alpha_max)
+    # alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0,
+    #                 alpha_max)
+
     return alpha
 
 
