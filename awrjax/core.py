@@ -269,7 +269,8 @@ def solve_images_jax(
         iters=4,
         decompose_iters=3,
         alpha_inters=3,
-        n_jobs=4):
+        n_jobs=4,
+        tol=0.05):
     '''
     Master solver, follows the algorithm given in the supplementary.
     W_init: Initial value of W
@@ -341,7 +342,7 @@ def solve_images_jax(
                                                 p,
                                                 decompose_iters,
                                                 verbose=False,
-                                                tol=0.05)
+                                                tol=tol)
             for J_i, Wk_i, Ik_i in zip(J, Wk, Ik))
 
         for i, (Wk_i, Ik_i) in enumerate(results):
