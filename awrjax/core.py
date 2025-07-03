@@ -1,20 +1,22 @@
-import jax.numpy as jnp
-from jax import jit
-from jax import Array
-import numpy as np
+from functools import partial
+
 import cv2
+import jax.numpy as jnp
+import numpy as np
+from jax import Array, jit
+from joblib import Parallel, delayed
 # from jax.experimental import sparse
 from scipy.sparse import coo_matrix, diags
-from scipy.sparse import vstack as sp_vstack
 from scipy.sparse import hstack as sp_hstack
+from scipy.sparse import vstack as sp_vstack
 from scipy.sparse.linalg import spsolve
-
+from poissonpy.functional import get_np_gradient
 from tqdm import tqdm
 
-from .jaxcv.filter import sobel, convolve_with_kernel, grad
-from .utils import binarize_img, normalize_img, spdiag, COO_spsolve
+from .jaxcv.filter import convolve_with_kernel, grad, sobel, sobel_cv2, grad_np
 # jax version can not work, let's use numpy version
 from .ref.alpha_matte_np import closed_form_matte
+from .utils import COO_spsolve, binarize_img, normalize_img, spdiag
 
 # pylint: disable=pointless-string-statement
 """ 
@@ -48,17 +50,19 @@ def estimate_watermark(J, verbose=False):
         print(f"Computing gradients of {len(J)} images")
 
     # Define a jitted function to compute Sobel gradients
-    @jit
-    def compute_gradients(J):
-        gradx = [sobel(j, axis='x') for j in J]
-        grady = [sobel(j, axis='y') for j in J]
-        return jnp.array(gradx), jnp.array(grady)
-
     # @jit
-    # def compute_gradients(J):
-    #     gradx = [jnp.gradient(j, axis=1) for j in J]
-    #     grady = [jnp.gradient(j, axis=0) for j in J]
-    #     return jnp.array(gradx), jnp.array(grady)
+    def compute_gradients(J):
+        # gradx = [sobel(j, axis='x') for j in J]
+        # grady = [sobel(j, axis='y') for j in J]
+        # gradx = [grad(j, axis='x') for j in J]
+        # grady = [grad(j, axis='y') for j in J]
+        gradx = []
+        grady = []
+        for j in J:
+            gx, gy = get_np_gradient(j, forward=True, batch=True, padding=True)
+            gradx.append(gx)
+            grady.append(gy)
+        return jnp.array(gradx), jnp.array(grady)
 
     gradx_arr, grady_arr = compute_gradients(J)
 
@@ -69,6 +73,25 @@ def estimate_watermark(J, verbose=False):
     grady_med = jnp.median(grady_arr, axis=0)
 
     return gradx_med, grady_med, gradx_arr, grady_arr
+
+
+def estimate_watermark_laplacian(J):
+    """
+    Input:
+        J: list of images
+    Output:
+        gradx_med: median of gradients in x-direction
+        grady_med: median of gradients in y-direction
+        gradx_arr: gradients in x-direction
+        grady_arr: gradients in y-direction
+    """
+    J = [np.asarray(img) for img in J]
+
+    lap = [cv2.Laplacian(j.astype(np.float32), cv2.CV_32F) for j in J]
+
+    lap_med = np.median(lap, axis=0)
+
+    return lap_med
 
 
 def box_watermark(gradx, grady, threshold=0.5, boundary_size=2):
@@ -103,52 +126,6 @@ def crop_watermark(gradx, grady, threshold=0.5, boundary_size=2):
 
     return gradx[i_min:i_max, j_min:j_max, :], grady[i_min:i_max,
                                                      j_min:j_max, :]
-
-
-def poisson_reconstruct(gradx,
-                        grady,
-                        num_iters=100,
-                        h=0.1,
-                        boundary_image=None,
-                        boundary_zero=True):
-    """
-	Iterative algorithm for Poisson reconstruction. 
-	Given the gradx and grady values, find laplacian, and solve for image
-	Also return the squared difference of every step.
-	h = convergence rate
-	"""
-    fxx = sobel(gradx, axis='x')
-    fyy = sobel(grady, axis='y')
-    # fxx = jnp.gradient(gradx, axis=1)
-    # fyy = jnp.gradient(grady, axis=0)
-    laplacian: Array = fxx + fyy  # type: ignore
-    m, n, p = laplacian.shape
-
-    if boundary_zero:
-        est = jnp.zeros(laplacian.shape)
-    elif boundary_image is None:
-        raise ValueError(
-            "Boundary image must be provided if boundary_zero is False")
-    elif boundary_image.shape != laplacian.shape:
-        raise ValueError(
-            "Boundary image must have the same shape as the laplacian")
-    else:
-        est = boundary_image.copy()
-
-    est = est.at[1:-1,
-                 1:-1, :].set(jnp.array(np.random.random((m - 2, n - 2, p))))
-    loss = []
-
-    for _ in range(num_iters):
-        old_est = est.copy()
-        est = est.at[1:-1, 1:-1, :].set(
-            0.25 *
-            (est[0:-2, 1:-1, :] + est[1:-1, 0:-2, :] + est[2:, 1:-1, :] +
-             est[1:-1, 2:, :] - h * h * laplacian[1:-1, 1:-1, :]))
-        error = np.sum(np.square(est - old_est))
-        loss.append(error)
-
-    return est, loss
 
 
 def detect_watermark(img,
@@ -188,22 +165,28 @@ def estimate_normalized_alpha(J,
                               _lambda=100,
                               threshold=0.7,
                               std_wm_thresh=0.2,
-                              std_bg_thresh=0.4):
+                              std_bg_thresh=0.4,
+                              n_jobs=1):
 
     prior, prior_confidence = get_matte_prior(J, Wm, _lambda, threshold,
                                               std_wm_thresh, std_bg_thresh)
+    prior = np.asarray(prior)
+    prior_confidence = np.asarray(prior_confidence)
 
     num = len(J)
     alpha_lst = []
 
     print(f"Estimating normalized alpha using {num} images.")
     # for all images, calculate alpha
-    for idx in tqdm(range(num)):
-        alpha = closed_form_matte(
-            np.asarray(J[idx]),
-            prior=np.asarray(prior),
-            prior_confidence=np.asarray(prior_confidence))
-        alpha_lst.append(alpha)
+    # for idx in tqdm(range(num)):
+    #     alpha = closed_form_matte(np.asarray(J[idx]),
+    #                               prior=prior,
+    #                               prior_confidence=prior_confidence)
+    #     alpha_lst.append(alpha)
+
+    alpha_lst = Parallel(n_jobs=n_jobs)(delayed(closed_form_matte)(
+        np.asarray(J[idx]), prior=prior, prior_confidence=prior_confidence)
+                                        for idx in range(num))
 
     alpha = np.median(alpha_lst, axis=0)
     return jnp.asarray(alpha)
@@ -216,7 +199,7 @@ def get_matte_prior(J, Wm, _lambda, threshold, std_wm_thresh, std_bg_thresh):
     is_watermark = (std_map < std_wm_thresh) | (Wm == 1)
     is_background = (std_map > std_bg_thresh) & (Wm == 0)
 
-    prior = is_watermark.astype(np.float64)
+    prior = np.asarray(is_watermark, dtype=np.float64)
     prior_confidence = np.ones_like(prior) * _lambda
     prior_confidence[~is_watermark & ~is_background] = 0
     return prior, prior_confidence
@@ -262,19 +245,31 @@ def estimate_blend_factor(J, Wm, alpha_norm):
 
 #     return C, est_Ik
 
+# NOTE: grad_np lead to grid like artifacts, should use sobel
+# grad_operator = grad_np
+grad_operator = partial(sobel_cv2, norm=True)
+# grad_operator = partial(grad_np, mode='forward')
+# grad_operator = partial(grad_np, mode='center')
 
-def solve_images_jax(J,
-                     Wm,
-                     alpha,
-                     W_init,
-                     gamma=1,
-                     beta=1,
-                     lambda_w=0.005,
-                     lambda_i=1,
-                     lambda_a=0.01,
-                     iters=4,
-                     decompose_iters=3,
-                     alpha_inters=3):
+
+def solve_images_jax(
+        J,
+        Wm,
+        alpha,
+        W_init,
+        #  EIk,
+        J_all=None,
+        est_Ik=None,
+        alpha_max=1,
+        gamma=1,
+        beta=1,
+        lambda_w=0.005,
+        lambda_i=1,
+        lambda_a=0.01,
+        iters=4,
+        decompose_iters=3,
+        alpha_inters=3,
+        n_jobs=4):
     '''
     Master solver, follows the algorithm given in the supplementary.
     W_init: Initial value of W
@@ -284,22 +279,29 @@ def solve_images_jax(J,
     J = np.asarray(J)
     K, m, n, p = J.shape
 
+    if J_all is not None:
+        if est_Ik is None:
+            raise ValueError("If J_all is given, est_Ik should be given")
+        J_all = np.asarray(J_all)
+
     sobelx = get_xSobel_matrix(m, n, p)
     sobely = get_ySobel_matrix(m, n, p)
     Ik = []
     Wk = []
+
+    _Wk = W_init.copy()
     for i in range(K):
-        Ik.append(J[i] - Wm)
-        Wk.append(W_init.copy())
+        Ik.append(np.clip((J[i] - Wm) / (1 - alpha), 0, 255))
+        Wk.append(_Wk)
 
     # This is for median images
-    W = W_init.copy()
+    W = _Wk.copy()
 
-    Wm_old = Wm.copy()
-    # alpha_old = alpha.copy()
+    # Wm_old = Wm.copy()
+    alpha_old = alpha.copy()
 
-    Wm_gx = sobel(Wm, axis='x')
-    Wm_gy = sobel(Wm, axis='y')
+    Wm_gx = grad_operator(Wm, axis='x')
+    Wm_gy = grad_operator(Wm, axis='y')
 
     # Iterations
     for ii in range(iters):
@@ -309,44 +311,44 @@ def solve_images_jax(J,
 
         # Step 1
         print("Step 1")
-        alpha_gx_abs = np.abs(sobel(alpha, axis='x'))
-        alpha_gy_abs = np.abs(sobel(alpha, axis='y'))
 
-        cx = diags(alpha_gx_abs.flatten())
-        cy = diags(alpha_gy_abs.flatten())
+        alpha_gx_abs, alpha_gy_abs, cx, cy, alpha_diag, alpha_bar_diag = prepare_alpha_related_parameters(
+            alpha)
 
-        alpha_diag = diags(alpha.flatten())
-        alpha_bar_diag = diags((1 - alpha).flatten())
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(decompose_wartermark_image)(J_i,
+                                                Wk_i,
+                                                Ik_i,
+                                                alpha,
+                                                alpha_gx_abs,
+                                                alpha_gy_abs,
+                                                alpha_diag,
+                                                alpha_bar_diag,
+                                                Wm,
+                                                Wm_gx,
+                                                Wm_gy,
+                                                W,
+                                                sobelx,
+                                                sobely,
+                                                cx,
+                                                cy,
+                                                gamma,
+                                                beta,
+                                                lambda_w,
+                                                lambda_i,
+                                                m,
+                                                n,
+                                                p,
+                                                decompose_iters,
+                                                verbose=False,
+                                                tol=0.05)
+            for J_i, Wk_i, Ik_i in zip(J, Wk, Ik))
 
-        for i in range(K):
+        for i, (Wk_i, Ik_i) in enumerate(results):
+            Wk[i] = Wk_i
+            Ik[i] = Ik_i
 
-            Wk[i], Ik[i] = decompose_wartermark_image(
-                J_i=J[i],
-                Wk_i=Wk[i],
-                Ik_i=Ik[i],
-                alpha=alpha,
-                alpha_gx_abs=alpha_gx_abs,
-                alpha_gy_abs=alpha_gy_abs,
-                alpha_diag=alpha_diag,
-                alpha_bar_diag=alpha_bar_diag,
-                Wm=Wm,
-                Wm_gx=Wm_gx,
-                Wm_gy=Wm_gy,
-                W=W,
-                sobelx=sobelx,
-                sobely=sobely,
-                cx=cx,
-                cy=cy,
-                gamma=gamma,
-                beta=beta,
-                lambda_w=lambda_w,
-                lambda_i=lambda_i,
-                m=m,
-                n=n,
-                p=p,
-                decompose_iters=decompose_iters)
-            
-            print(f"Image {i+1}/{K} decomposed.")
+        # res = (np.median(Ik_f, axis=0) - EIk)
 
         # Step 2
         print("Step 2")
@@ -356,47 +358,112 @@ def solve_images_jax(J,
         print("Step 3")
         W_diag = diags(W.reshape(-1))
 
+        step3_alpha_old = alpha.copy()
+        first_rdiff = None
+        if_converge = False
+
         for j in range(alpha_inters):
 
-            alpha = update_alpha(J=J,
-                                 Wk=Wk,
-                                 Ik=Ik,
-                                 W=W,
-                                 W_diag=W_diag,
-                                 Wm_gx=Wm_gx,
-                                 Wm_gy=Wm_gy,
-                                 Wm=Wm,
-                                 alpha=alpha,
-                                 alpha_gx_abs=alpha_gx_abs,
-                                 alpha_gy_abs=alpha_gy_abs,
-                                 sobelx=sobelx,
-                                 sobely=sobely,
-                                 beta=beta,
-                                 lambda_a=lambda_a,
-                                 K=K,
-                                 m=m,
-                                 n=n,
-                                 p=p)
+            alpha = update_alpha(
+                J=J,
+                Wk=Wk,
+                Ik=Ik,
+                W=W,
+                W_diag=W_diag,
+                Wm_gx=Wm_gx,
+                Wm_gy=Wm_gy,
+                Wm=Wm,
+                alpha=alpha,
+                #  alpha_gx_abs=alpha_gx_abs,
+                #  alpha_gy_abs=alpha_gy_abs,
+                sobelx=sobelx,
+                sobely=sobely,
+                beta=beta,
+                lambda_a=lambda_a,
+                K=K,
+                m=m,
+                n=n,
+                p=p,
+                alpha_max=alpha_max)
 
-            print(f"alpha_inters: {j+1}/{alpha_inters}")
+            rdiff_alpha = np.linalg.norm(
+                alpha - step3_alpha_old) / np.linalg.norm(alpha)
+            step3_alpha_old = alpha.copy()
 
-        # print(np.linalg.norm(alpha - alpha_old))
-        # alpha_old = alpha.copy()
+            if first_rdiff is None:
+                first_rdiff = rdiff_alpha
+            else:
+                if rdiff_alpha < 0.5 * first_rdiff:
+                    if_converge = True
+                    print(f"alpha converge at {j+1}/{alpha_inters}")
+                    print(f"first_rdiff: {first_rdiff}")
+                    print(f"rdiff_alpha: {rdiff_alpha}")
+                    break
 
-        Wm = alpha * W
-        print(np.linalg.norm(Wm - Wm_old))
-        Wm_old = Wm.copy()
+            # print(f"alpha_inters: {j+1}/{alpha_inters}")
+
+        if not if_converge:
+            print("Warning: alpha not converge")
+            print(f"rdiff_alpha: {rdiff_alpha}")  # type: ignore
+
+        print(np.linalg.norm(alpha - alpha_old))
+        alpha_old = alpha.copy()
+
+        # Wm = alpha * W
+        # print(np.linalg.norm(Wm - Wm_old))
+        # Wm_old = Wm.copy()
+
+        if J_all is not None:
+            residual = (np.median(np.asarray(J_all) - W * alpha, axis=0) /
+                        (1 - alpha) - est_Ik)
+            for i in range(K):
+                Ik[i] = Ik[i] - residual
 
     return (Wk, Ik, W, alpha)
 
 
-def update_alpha(J, Wk, Ik, W, W_diag, Wm_gx, Wm_gy, Wm, alpha, alpha_gx_abs,
-                 alpha_gy_abs, sobelx, sobely, beta, lambda_a, K, m, n, p):
+def prepare_alpha_related_parameters(alpha):
+    alpha_gx_abs = np.abs(grad_operator(alpha, axis='x'))
+    alpha_gy_abs = np.abs(grad_operator(alpha, axis='y'))
+
+    cx = diags(alpha_gx_abs.flatten())
+    cy = diags(alpha_gy_abs.flatten())
+
+    alpha_diag = diags(alpha.flatten())
+    alpha_bar_diag = diags((1 - alpha).flatten())
+
+    return alpha_gx_abs, alpha_gy_abs, cx, cy, alpha_diag, alpha_bar_diag
+
+
+def update_alpha(
+        J,
+        Wk,
+        Ik,
+        W,
+        W_diag,
+        Wm_gx,
+        Wm_gy,
+        Wm,
+        alpha,
+        #  alpha_gx_abs,
+        #  alpha_gy_abs,
+        sobelx,
+        sobely,
+        beta,
+        lambda_a,
+        K,
+        m,
+        n,
+        p,
+        alpha_max=1):
+
+    alpha_gx_abs = np.abs(grad_operator(alpha, axis='x'))
+    alpha_gy_abs = np.abs(grad_operator(alpha, axis='y'))
 
     for i in range(K):
         alphaWk = alpha * Wk[i]
-        alphaWk_gx = sobel(alphaWk, axis='x')
-        alphaWk_gy = sobel(alphaWk, axis='y')
+        alphaWk_gx = grad_operator(alphaWk, axis='x')
+        alphaWk_gy = grad_operator(alphaWk, axis='y')
         phi_f = diags(
             func_phi_deriv(((Wm_gx - alphaWk_gx)**2 +
                             (Wm_gy - alphaWk_gy)**2).reshape(-1)))
@@ -425,7 +492,8 @@ def update_alpha(J, Wk, Ik, W, W_diag, Wm_gx, Wm_gy, Wm, alpha, alpha_gx_abs,
 
     alpha = spsolve(A1, b1).reshape(m, n, p)
     # alpha = np.clip(alpha, 0, 1)
-    alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0, 1)
+    alpha = np.clip(np.stack([np.mean(alpha, axis=-1)] * 3, axis=-1), 0,
+                    alpha_max)
     return alpha
 
 
@@ -441,9 +509,13 @@ def func_phi_deriv(X, epsilon=1e-3):
 def _get_ysobel_coord(coord, shape):
     i, j, k = coord
     m, n, p = shape
+    return [(i - 1, j, k, -2 / 8), (i - 1, j - 1, k, -1 / 8),
+            (i - 1, j + 1, k, -1 / 8), (i + 1, j, k, 2 / 8),
+            (i + 1, j - 1, k, 1 / 8), (i + 1, j + 1, k, 1 / 8)]
     # return [(i - 1, j, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
     #         (i + 1, j, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
-    return [(i - 1, j, k, -1), (i + 1, j, k, 1)]
+    # return [(i - 1, j, k, -1), (i + 1, j, k, 1)]
+    # return [(i, j, k, -1), (i + 1, j, k, 1)]
 
 
 # get sobel coordinates for x
@@ -452,7 +524,11 @@ def _get_xsobel_coord(coord, shape):
     m, n, p = shape
     # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
     #         (i, j + 1, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
-    return [(i, j - 1, k, -1), (i, j + 1, k, 1)]
+    return [(i, j - 1, k, -2 / 8), (i - 1, j - 1, k, -1 / 8),
+            (i - 1, j + 1, k, -1 / 8), (i, j + 1, k, 2 / 8),
+            (i + 1, j - 1, k, 1 / 8), (i + 1, j + 1, k, 1 / 8)]
+    # return [(i, j - 1, k, -1), (i, j + 1, k, 1)]
+    # return [(i, j, k, -1), (i, j + 1, k, 1)]
 
 
 # filter
@@ -536,7 +612,11 @@ def decompose_wartermark_image(J_i,
                                n,
                                p,
                                decompose_iters,
+                               tol=0.05,
                                verbose=False):
+
+    Wk_old = Wk_i.copy()
+    Ik_old = Ik_i.copy()
 
     for j in range(decompose_iters):
 
@@ -565,8 +645,26 @@ def decompose_wartermark_image(J_i,
             n=n,
             p=p)
 
+        rdiff_Wk = np.linalg.norm(Wk_i - Wk_old) / np.linalg.norm(Wk_old)
+        rdiff_Ik = np.linalg.norm(Ik_i - Ik_old) / np.linalg.norm(Ik_old)
+
+        if (rdiff_Wk < tol) and (rdiff_Ik < tol):
+            if verbose:
+                print(f"Converged in {j+1} iterations")
+                print(f"Final rdiff_Wk: {rdiff_Wk}")
+                print(f"Final rdiff_Ik: {rdiff_Ik}")
+            return Wk_i, Ik_i
+
+        Wk_old = Wk_i.copy()
+        Ik_old = Ik_i.copy()
+
         if verbose:
             print(f"{j+1}/{decompose_iters}")
+
+    if verbose:
+        print("Not converged")
+        print(f"Final rdiff_Wk: {rdiff_Wk}")  # type: ignore
+        print(f"Final rdiff_Ik: {rdiff_Ik}")  # type: ignore
 
     return Wk_i, Ik_i
 
@@ -579,15 +677,15 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
 
     size = m * n * p
 
-    Wkx = sobel(Wk_i, axis='x')
-    Wky = sobel(Wk_i, axis='y')
+    Wkx = grad_operator(Wk_i, axis='x')
+    Wky = grad_operator(Wk_i, axis='y')
 
-    Ikx = sobel(Ik_i, axis='x')
-    Iky = sobel(Ik_i, axis='y')
+    Ikx = grad_operator(Ik_i, axis='x')
+    Iky = grad_operator(Ik_i, axis='y')
 
     alphaWk = alpha * Wk_i
-    alphaWk_gx = sobel(alphaWk, axis='x')
-    alphaWk_gy = sobel(alphaWk, axis='y')
+    alphaWk_gx = grad_operator(alphaWk, axis='x')
+    alphaWk_gy = grad_operator(alphaWk, axis='y')
 
     phi_data = diags(
         func_phi_deriv(
@@ -610,12 +708,13 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
     L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
     A_f = alpha_diag.T @ (L_f) @ (alpha_diag) + gamma * phi_aux
 
-    bW = alpha_diag @ (phi_data) @ (J_i.flatten()) + beta * L_f @ (
-        Wm.flatten()) + gamma * phi_aux @ (W.flatten())
-    bI = alpha_bar_diag @ (phi_data) @ (J_i.flatten())
 
     A = sp_vstack([sp_hstack([(alpha_diag**2)*phi_data + lambda_w*L_w + beta*A_f, alpha_diag*alpha_bar_diag*phi_data]), \
                     sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data + lambda_i*L_i])]).tocsr()
+
+    bW = alpha_diag @ (phi_data) @ (J_i.flatten()) + beta * L_f @ (
+        Wm.flatten()) + gamma * phi_aux @ (W.flatten())
+    bI = alpha_bar_diag @ (phi_data) @ (J_i.flatten())
 
     b = np.hstack([bW, bI])
     # return A, b
@@ -623,5 +722,8 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
 
     Wk_i_new = np.clip(x[:size].reshape(m, n, p), 0, 255)  # type: ignore
     Ik_i_new = np.clip(x[size:].reshape(m, n, p), 0, 255)  # type: ignore
+
+    # Wk_i_new = x[:size].reshape(m, n, p)  # type: ignore
+    # Ik_i_new = x[size:].reshape(m, n, p)  # type: ignore
 
     return Wk_i_new, Ik_i_new
