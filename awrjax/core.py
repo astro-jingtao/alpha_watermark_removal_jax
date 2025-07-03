@@ -499,8 +499,8 @@ def prepare_alpha_related_parameters(alpha):
     alpha_gx = grad_operator(alpha, axis='x')
     alpha_gy = grad_operator(alpha, axis='y')
 
-    cx = diags(alpha_gx.flatten())
-    cy = diags(alpha_gy.flatten())
+    cx = diags(np.abs(alpha_gx).flatten())
+    cy = diags(np.abs(alpha_gy).flatten())
 
     alpha_diag = diags(alpha.flatten())
     alpha_bar_diag = diags((1 - alpha).flatten())
@@ -598,10 +598,10 @@ def _get_xsobel_coord(coord, shape):
     i, j, k = coord
     m, n, p = shape
     return [(i, j - 1, k, -2 / 8), (i - 1, j - 1, k, -1 / 8),
-            (i - 1, j + 1, k, -1 / 8), (i, j + 1, k, 2 / 8),
-            (i + 1, j - 1, k, 1 / 8), (i + 1, j + 1, k, 1 / 8)]
-    # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
-    #         (i, j + 1, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
+            (i - 1, j + 1, k, 1 / 8), (i, j + 1, k, 2 / 8),
+            (i + 1, j - 1, k, -1 / 8), (i + 1, j + 1, k, 1 / 8)]
+    # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, 1),
+    #         (i, j + 1, k, 2), (i + 1, j - 1, k, -1), (i + 1, j + 1, k, 1)]
     # return [(i, j - 1, k, -1), (i, j + 1, k, 1)]
     # return [(i, j, k, -1), (i, j + 1, k, 1)]
 
@@ -784,8 +784,7 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx,
         func_phi_deriv(alpha_gx_abs * (Wkx**2) + alpha_gy_abs *
                        (Wky**2)).flatten())
 
-    L_i = sobelx @ (cx * phi_rI) @ (sobelx) + sobely @ (cy *
-                                                          phi_rI) @ (sobely)
+    L_i = sobelx @ (cx * phi_rI) @ (sobelx) + sobely @ (cy * phi_rI) @ (sobely)
     L_w = sobelx @ (cx * phi_rW) @ (sobelx) + sobely @ (cy * phi_rW) @ (sobely)
     K_fx = sobelx @ phi_f @ alpha_diag
     K_fy = sobely @ phi_f @ alpha_diag
