@@ -312,7 +312,7 @@ def solve_images_jax(
         # Step 1
         print("Step 1")
 
-        alpha_gx_abs, alpha_gy_abs, cx, cy, alpha_diag, alpha_bar_diag = prepare_alpha_related_parameters(
+        alpha_gx, alpha_gy, cx, cy, alpha_diag, alpha_bar_diag = prepare_alpha_related_parameters(
             alpha)
 
         results = Parallel(n_jobs=n_jobs)(
@@ -320,8 +320,8 @@ def solve_images_jax(
                                                 Wk_i,
                                                 Ik_i,
                                                 alpha,
-                                                alpha_gx_abs,
-                                                alpha_gy_abs,
+                                                alpha_gx,
+                                                alpha_gy,
                                                 alpha_diag,
                                                 alpha_bar_diag,
                                                 Wm,
@@ -456,7 +456,7 @@ def just_decompose(J,
     Wm_gx = grad_operator(Wm, axis='x')
     Wm_gy = grad_operator(Wm, axis='y')
 
-    alpha_gx_abs, alpha_gy_abs, cx, cy, alpha_diag, alpha_bar_diag = prepare_alpha_related_parameters(
+    alpha_gx, alpha_gy, cx, cy, alpha_diag, alpha_bar_diag = prepare_alpha_related_parameters(
         alpha)
 
     results = Parallel(n_jobs=n_jobs)(
@@ -464,8 +464,8 @@ def just_decompose(J,
                                             Wk_i,
                                             Ik_i,
                                             alpha,
-                                            alpha_gx_abs,
-                                            alpha_gy_abs,
+                                            alpha_gx,
+                                            alpha_gy,
                                             alpha_diag,
                                             alpha_bar_diag,
                                             Wm,
@@ -496,16 +496,16 @@ def just_decompose(J,
 
 
 def prepare_alpha_related_parameters(alpha):
-    alpha_gx_abs = np.abs(grad_operator(alpha, axis='x'))
-    alpha_gy_abs = np.abs(grad_operator(alpha, axis='y'))
+    alpha_gx = grad_operator(alpha, axis='x')
+    alpha_gy = grad_operator(alpha, axis='y')
 
-    cx = diags(alpha_gx_abs.flatten())
-    cy = diags(alpha_gy_abs.flatten())
+    cx = diags(alpha_gx.flatten())
+    cy = diags(alpha_gy.flatten())
 
     alpha_diag = diags(alpha.flatten())
     alpha_bar_diag = diags((1 - alpha).flatten())
 
-    return alpha_gx_abs, alpha_gy_abs, cx, cy, alpha_diag, alpha_bar_diag
+    return alpha_gx, alpha_gy, cx, cy, alpha_diag, alpha_bar_diag
 
 
 def update_alpha(
@@ -597,11 +597,11 @@ def _get_ysobel_coord(coord, shape):
 def _get_xsobel_coord(coord, shape):
     i, j, k = coord
     m, n, p = shape
-    # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
-    #         (i, j + 1, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
     return [(i, j - 1, k, -2 / 8), (i - 1, j - 1, k, -1 / 8),
             (i - 1, j + 1, k, -1 / 8), (i, j + 1, k, 2 / 8),
             (i + 1, j - 1, k, 1 / 8), (i + 1, j + 1, k, 1 / 8)]
+    # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
+    #         (i, j + 1, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
     # return [(i, j - 1, k, -1), (i, j + 1, k, 1)]
     # return [(i, j, k, -1), (i, j + 1, k, 1)]
 
@@ -667,8 +667,8 @@ def decompose_wartermark_image(J_i,
                                Wk_i,
                                Ik_i,
                                alpha,
-                               alpha_gx_abs,
-                               alpha_gy_abs,
+                               alpha_gx,
+                               alpha_gy,
                                alpha_diag,
                                alpha_bar_diag,
                                Wm,
@@ -700,8 +700,8 @@ def decompose_wartermark_image(J_i,
             Wk_i=Wk_i,
             Ik_i=Ik_i,
             alpha=alpha,
-            alpha_gx_abs=alpha_gx_abs,
-            alpha_gy_abs=alpha_gy_abs,
+            alpha_gx=alpha_gx,
+            alpha_gy=alpha_gy,
             alpha_diag=alpha_diag,
             alpha_bar_diag=alpha_bar_diag,
             Wm=Wm,
@@ -746,11 +746,11 @@ def decompose_wartermark_image(J_i,
     return Wk_i, Ik_i
 
 
-def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
-                                       alpha_gy_abs, alpha_diag,
-                                       alpha_bar_diag, Wm, Wm_gx, Wm_gy, W,
-                                       sobelx, sobely, cx, cy, gamma, beta,
-                                       lambda_w, lambda_i, m, n, p):
+def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx,
+                                       alpha_gy, alpha_diag, alpha_bar_diag,
+                                       Wm, Wm_gx, Wm_gy, W, sobelx, sobely, cx,
+                                       cy, gamma, beta, lambda_w, lambda_i, m,
+                                       n, p):
 
     size = m * n * p
 
@@ -759,6 +759,12 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
 
     Ikx = grad_operator(Ik_i, axis='x')
     Iky = grad_operator(Ik_i, axis='y')
+
+    alpha_gx_abs = np.abs(alpha_gx)
+    alpha_gy_abs = np.abs(alpha_gy)
+
+    alpha_gx_diag = diags(alpha_gx.flatten())
+    alpha_gy_diag = diags(alpha_gy.flatten())
 
     alphaWk = alpha * Wk_i
     alphaWk_gx = grad_operator(alphaWk, axis='x')
@@ -778,29 +784,32 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx_abs,
         func_phi_deriv(alpha_gx_abs * (Wkx**2) + alpha_gy_abs *
                        (Wky**2)).flatten())
 
-    L_i = sobelx.T @ (cx * phi_rI) @ (sobelx) + sobely.T @ (cy *
-                                                            phi_rI) @ (sobely)
-    L_w = sobelx.T @ (cx * phi_rW) @ (sobelx) + sobely.T @ (cy *
-                                                            phi_rW) @ (sobely)
-    L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
-    A_f = alpha_diag.T @ (L_f) @ (alpha_diag) + gamma * phi_aux
+    L_i = sobelx @ (cx * phi_rI) @ (sobelx) + sobely @ (cy *
+                                                          phi_rI) @ (sobely)
+    L_w = sobelx @ (cx * phi_rW) @ (sobelx) + sobely @ (cy * phi_rW) @ (sobely)
+    K_fx = sobelx @ phi_f @ alpha_diag
+    K_fy = sobely @ phi_f @ alpha_diag
+    A_f = K_fx @ (alpha_gx_diag + alpha_diag @ sobelx) + K_fy @ (
+        alpha_gy_diag + alpha_diag @ sobely)
 
+    A_ul = (alpha_diag**
+            2) * phi_data + gamma * phi_aux - lambda_w * L_w - beta * A_f
 
-    A = sp_vstack([sp_hstack([(alpha_diag**2)*phi_data + lambda_w*L_w + beta*A_f, alpha_diag*alpha_bar_diag*phi_data]), \
-                    sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data + lambda_i*L_i])]).tocsr()
+    A = sp_vstack([sp_hstack([A_ul, alpha_diag*alpha_bar_diag*phi_data]), \
+                    sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data - lambda_i*L_i])]).tocsr()
 
-    bW = alpha_diag @ (phi_data) @ (J_i.flatten()) + beta * L_f @ (
-        Wm.flatten()) + gamma * phi_aux @ (W.flatten())
+    bW = alpha_diag @ (phi_data) @ (J_i.flatten()) + gamma * phi_aux @ (
+        W.flatten()) - beta * (K_fx @ sobelx + K_fy @ sobely) @ (Wm.flatten())
     bI = alpha_bar_diag @ (phi_data) @ (J_i.flatten())
 
     b = np.hstack([bW, bI])
     # return A, b
     x = spsolve(A, b)
 
-    # Wk_i_new = np.clip(x[:size].reshape(m, n, p), 0, 255)  # type: ignore
-    # Ik_i_new = np.clip(x[size:].reshape(m, n, p), 0, 255)  # type: ignore
+    Wk_i_new = np.clip(x[:size].reshape(m, n, p), 0, 255)  # type: ignore
+    Ik_i_new = np.clip(x[size:].reshape(m, n, p), 0, 255)  # type: ignore
 
-    Wk_i_new = x[:size].reshape(m, n, p)  # type: ignore
-    Ik_i_new = x[size:].reshape(m, n, p)  # type: ignore
+    # Wk_i_new = x[:size].reshape(m, n, p)  # type: ignore
+    # Ik_i_new = x[size:].reshape(m, n, p)  # type: ignore
 
     return Wk_i_new, Ik_i_new
