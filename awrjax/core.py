@@ -272,7 +272,12 @@ def solve_images_jax(
         n_jobs=4,
         tol=0.05):
     '''
-    Master solver, follows the algorithm given in the supplementary.
+    gamma: phi_aux, Wk looks like W
+    beta: phi_f, alpha W have similar gradient as Wm
+    lambda_w: W smoothness in large alpha gradient
+    lambda_i: I smoothness in large alpha gradient
+    lambda_a: alpha smoothness
+
     W_init: Initial value of W
     Step 1: Image Watermark decomposition
     '''
@@ -357,7 +362,6 @@ def solve_images_jax(
 
         # Step 3
         print("Step 3")
-        W_diag = diags(W.reshape(-1))
 
         step3_alpha_old = alpha.copy()
         first_rdiff = None
@@ -367,10 +371,8 @@ def solve_images_jax(
 
             alpha = update_alpha(
                 J=J,
-                Wk=Wk,
                 Ik=Ik,
                 W=W,
-                W_diag=W_diag,
                 Wm_gx=Wm_gx,
                 Wm_gy=Wm_gy,
                 Wm=Wm,
@@ -406,6 +408,7 @@ def solve_images_jax(
 
         if not if_converge:
             print("Warning: alpha not converge")
+            print(f"first_rdiff: {first_rdiff}")
             print(f"rdiff_alpha: {rdiff_alpha}")  # type: ignore
 
         print(np.linalg.norm(alpha - alpha_old))
@@ -511,10 +514,8 @@ def prepare_alpha_related_parameters(alpha):
 
 def update_alpha(
         J,
-        Wk,
         Ik,
         W,
-        W_diag,
         Wm_gx,
         Wm_gy,
         Wm,
@@ -538,20 +539,28 @@ def update_alpha(
     alphaWk_gx = grad_operator(alphaWk, axis='x')
     alphaWk_gy = grad_operator(alphaWk, axis='y')
 
+    W_gx = grad_operator(W, axis='x')
+    W_gy = grad_operator(W, axis='y')
+
+    W_diag = diags(W.flatten())
+    W_gx_diag = diags(W_gx.flatten())
+    W_gy_diag = diags(W_gy.flatten())
+
     phi_alpha = diags(
-        func_phi_deriv(alpha_gx_abs**2 + alpha_gy_abs**2).reshape(-1))
-
-    L_alpha = sobelx.T @ (phi_alpha @ (sobelx)) + sobely.T @ (
-        phi_alpha @ (sobely))
-
+        func_phi_deriv(alpha_gx_abs**2 + alpha_gy_abs**2).flatten())
     phi_f = diags(
         func_phi_deriv(
-            ((Wm_gx - alphaWk_gx)**2 + (Wm_gy - alphaWk_gy)**2).reshape(-1)))
-    L_f = sobelx.T @ (phi_f) @ (sobelx) + sobely.T @ (phi_f) @ (sobely)
-    A_tilde_f = W_diag.T @ (L_f) @ (W_diag)
+            ((Wm_gx - alphaWk_gx)**2 + (Wm_gy - alphaWk_gy)**2).flatten()))
 
-    A1 = lambda_a * L_alpha + beta * A_tilde_f
-    b1 = beta * W_diag @ (L_f) @ (Wm.reshape(-1))
+    L_alpha = sobelx @ (phi_alpha @ (sobelx)) + sobely @ (phi_alpha @ (sobely))
+
+    K_fx = sobelx @ phi_f @ W_diag
+    K_fy = sobely @ phi_f @ W_diag
+    A_f = K_fx @ (W_gx_diag + W_diag @ sobelx) + K_fy @ (W_gy_diag +
+                                                         W_diag @ sobely)
+
+    A1 = -lambda_a * L_alpha - beta * A_f
+    b1 = -beta * (K_fx @ sobelx + K_fy @ sobely) @ (Wm.flatten())
 
     for i in range(K):
 
