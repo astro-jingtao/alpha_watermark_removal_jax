@@ -12,6 +12,7 @@ from scipy.sparse import vstack as sp_vstack
 from scipy.sparse.linalg import spsolve
 from poissonpy.functional import get_np_gradient
 from tqdm import tqdm
+from ait.conv_to_matrix import kernel_to_matrix
 
 from .jaxcv.filter import convolve_with_kernel, grad, sobel, sobel_cv2, grad_np
 # jax version can not work, let's use numpy version
@@ -205,51 +206,28 @@ def get_matte_prior(J, Wm, _lambda, threshold, std_wm_thresh, std_bg_thresh):
     return prior, prior_confidence
 
 
-def estimate_blend_factor(J, Wm, alpha_norm):
-    J = jnp.asarray(J)
-    K, m, n, p = J.shape
-    Jm = (J - Wm)
-    gx_jm = []
-    gy_jm = []
+def estimate_blend_factor(J, alpha_n, Wm, edge_threshold=0.001):
+    _std = jnp.std(jnp.asarray(J), axis=0)
+    std_I = jnp.median(_std[alpha_n == 0], axis=0)
+    C = 1 - jnp.median(_std[alpha_n == 1], axis=0) / std_I
+    alpha = alpha_n[..., None] * jnp.array(C)
+    est_Ik = jnp.median(jnp.asarray(J) - Wm, axis=0)
+    alpha_std = 1 - (_std / std_I)
+    alpha_n_gx = grad_operator(np.asarray(alpha_n, dtype=np.float32), axis='x')
+    alpha_n_gy = grad_operator(np.asarray(alpha_n, dtype=np.float32), axis='y')
+    is_edge = (alpha_n_gx**2 + alpha_n_gy**2) > edge_threshold
+    alpha_mix = np.array(alpha.copy())
+    alpha_mix[is_edge] = alpha_std[is_edge]
+    return C, est_Ik, alpha_mix
 
-    for i in range(K):
-        gx_jm.append(sobel(Jm[i], axis='x'))
-        gy_jm.append(sobel(Jm[i], axis='y'))
-
-    gx_jm = jnp.array(gx_jm)
-    gy_jm = jnp.array(gy_jm)
-
-    Jm_grad = jnp.sqrt(gx_jm**2 + gy_jm**2)
-
-    est_Ik = alpha_norm[..., jnp.newaxis] * jnp.median(J, axis=0)
-    # est_Ik = jnp.median(J, axis=0)
-    gx_estIk = sobel(est_Ik, axis='x')
-    gy_estIk = sobel(est_Ik, axis='y')
-    estIk_grad = np.sqrt(gx_estIk**2 + gy_estIk**2)
-
-    C = []
-    for i in range(3):
-        c_i = jnp.sum(Jm_grad[:, :, :, i] * estIk_grad[:, :, i]) / jnp.sum(
-            jnp.square(estIk_grad[:, :, i])) / K
-        C.append(c_i)
-
-    return C, est_Ik
-
-
-# def estimate_blend_factor(J, Wm, alpha_norm):
-#     J = jnp.asarray(J)
-#     K, m, n, p = J.shape
-#     Jm = (J - Wm)
-
-#     est_Ik = jnp.median(Jm, axis=0)
-
-#     return C, est_Ik
 
 # NOTE: grad_np lead to grid like artifacts, should use sobel
 # grad_operator = grad_np
 grad_operator = partial(sobel_cv2, norm=True)
 # grad_operator = partial(grad_np, mode='forward')
 # grad_operator = partial(grad_np, mode='center')
+# grad_kernel = 'gradf' # it can not work due to numerical instability?
+grad_kernel = 'sobel'
 
 
 def solve_images_jax(
@@ -290,8 +268,16 @@ def solve_images_jax(
             raise ValueError("If J_all is given, est_Ik should be given")
         J_all = np.asarray(J_all)
 
-    sobelx = get_xSobel_matrix(m, n, p)
-    sobely = get_ySobel_matrix(m, n, p)
+    sobelx = kernel_to_matrix(m,
+                              n,
+                              p,
+                              kernel_type=f'x{grad_kernel}',
+                              normalize=True)
+    sobely = kernel_to_matrix(m,
+                              n,
+                              p,
+                              kernel_type=f'y{grad_kernel}',
+                              normalize=True)
     Ik = []
     Wk = []
 
@@ -444,8 +430,16 @@ def just_decompose(J,
     J = np.asarray(J)
     K, m, n, p = J.shape
 
-    sobelx = get_xSobel_matrix(m, n, p)
-    sobely = get_ySobel_matrix(m, n, p)
+    sobelx = kernel_to_matrix(m,
+                              n,
+                              p,
+                              kernel_type=f'x{grad_kernel}',
+                              normalize=True)
+    sobely = kernel_to_matrix(m,
+                              n,
+                              p,
+                              kernel_type=f'y{grad_kernel}',
+                              normalize=True)
     Ik = []
     Wk = []
 
@@ -588,89 +582,6 @@ def func_phi(X, epsilon=1e-3):
 
 def func_phi_deriv(X, epsilon=1e-3):
     return 0.5 / func_phi(X, epsilon)
-
-
-# get sobel coordinates for y
-def _get_ysobel_coord(coord, shape):
-    i, j, k = coord
-    m, n, p = shape
-    return [(i - 1, j, k, -2 / 8), (i - 1, j - 1, k, -1 / 8),
-            (i - 1, j + 1, k, -1 / 8), (i + 1, j, k, 2 / 8),
-            (i + 1, j - 1, k, 1 / 8), (i + 1, j + 1, k, 1 / 8)]
-    # return [(i - 1, j, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, -1),
-    #         (i + 1, j, k, 2), (i + 1, j - 1, k, 1), (i + 1, j + 1, k, 1)]
-    # return [(i - 1, j, k, -1), (i + 1, j, k, 1)]
-    # return [(i, j, k, -1), (i + 1, j, k, 1)]
-
-
-# get sobel coordinates for x
-def _get_xsobel_coord(coord, shape):
-    i, j, k = coord
-    m, n, p = shape
-    return [(i, j - 1, k, -2 / 8), (i - 1, j - 1, k, -1 / 8),
-            (i - 1, j + 1, k, 1 / 8), (i, j + 1, k, 2 / 8),
-            (i + 1, j - 1, k, -1 / 8), (i + 1, j + 1, k, 1 / 8)]
-    # return [(i, j - 1, k, -2), (i - 1, j - 1, k, -1), (i - 1, j + 1, k, 1),
-    #         (i, j + 1, k, 2), (i + 1, j - 1, k, -1), (i + 1, j + 1, k, 1)]
-    # return [(i, j - 1, k, -1), (i, j + 1, k, 1)]
-    # return [(i, j, k, -1), (i, j + 1, k, 1)]
-
-
-# filter
-def _filter_list_item(coord, shape):
-    i, j, k, v = coord
-    m, n, p = shape
-    if i >= 0 and i < m and j >= 0 and j < n:
-        return True
-
-
-# Change to ravel index
-# also filters the wrong guys
-def _change_to_ravel_index(li, shape):
-    li = filter(lambda x: _filter_list_item(x, shape), li)
-    i, j, k, v = zip(*li)
-    return zip(np.ravel_multi_index((i, j, k), shape), v)
-
-
-def get_ySobel_matrix(m, n, p):
-    size = m * n * p
-    shape = (m, n, p)
-    i, j, k = np.unravel_index(np.arange(size), (m, n, p))
-    ijk = zip(list(i), list(j), list(k))
-    ijk_nbrs = map(lambda x: _get_ysobel_coord(x, shape), ijk)
-    ijk_nbrs_to_index = map(lambda l: _change_to_ravel_index(l, shape),
-                            ijk_nbrs)
-    # we get a list of idx, values for a particular idx
-    # we have got the complete list now, map it to actual index
-    actual_map = []
-    for i, list_of_coords in enumerate(ijk_nbrs_to_index):
-        for coord in list_of_coords:
-            actual_map.append((i, coord[0], coord[1]))
-
-    i, j, vals = zip(*actual_map)
-    # return sparse.BCOO((jnp.asarray(vals), jnp.c_[i, j]), shape=(size, size))
-    return coo_matrix((vals, (i, j)), shape=(size, size))
-
-
-# get Sobel sparse matrix for X
-def get_xSobel_matrix(m, n, p):
-    size = m * n * p
-    shape = (m, n, p)
-    i, j, k = np.unravel_index(np.arange(size), (m, n, p))
-    ijk = zip(list(i), list(j), list(k))
-    ijk_nbrs = map(lambda x: _get_xsobel_coord(x, shape), ijk)
-    ijk_nbrs_to_index = map(lambda l: _change_to_ravel_index(l, shape),
-                            ijk_nbrs)
-    # we get a list of idx, values for a particular idx
-    # we have got the complete list now, map it to actual index
-    actual_map = []
-    for i, list_of_coords in enumerate(ijk_nbrs_to_index):
-        for coord in list_of_coords:
-            actual_map.append((i, coord[0], coord[1]))
-
-    i, j, vals = zip(*actual_map)
-    # return sparse.BCOO((jnp.asarray(vals), jnp.c_[i, j]), shape=(size, size))
-    return coo_matrix((vals, (i, j)), shape=(size, size))
 
 
 def decompose_wartermark_image(J_i,
