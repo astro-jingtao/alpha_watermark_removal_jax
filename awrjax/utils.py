@@ -1,13 +1,19 @@
 import os
 
-from jax.experimental import sparse
 import jax.numpy as jnp
+import numpy as np
 from ait.utils import read_img
+from jax.experimental import sparse
 
 
 def normalize_img(img, axis=None):
     return (img - jnp.min(img, axis=axis)) / (jnp.max(img, axis=axis) -
                                               jnp.min(img, axis=axis))
+
+
+def normalize_img_np(img, axis=None):
+    return (img - np.min(img, axis=axis)) / (np.max(img, axis=axis) -
+                                             np.min(img, axis=axis))
 
 
 def binarize_img(img, threshold=0.5):

@@ -3,18 +3,19 @@ from functools import partial
 import cv2
 import jax.numpy as jnp
 import numpy as np
+from ait.conv_to_matrix import kernel_to_matrix
 from jax import Array, jit
 from joblib import Parallel, delayed
+from poissonpy.functional import get_np_gradient
 # from jax.experimental import sparse
 from scipy.sparse import coo_matrix, diags
 from scipy.sparse import hstack as sp_hstack
 from scipy.sparse import vstack as sp_vstack
 from scipy.sparse.linalg import spsolve
-from poissonpy.functional import get_np_gradient
 from tqdm import tqdm
-from ait.conv_to_matrix import kernel_to_matrix
 
-from .jaxcv.filter import convolve_with_kernel, grad, sobel, sobel_cv2, grad_np
+from .jaxcv.filter import convolve_with_kernel, grad, grad_np, sobel, sobel_cv2
+from .post_process import alpha_W_correction, clean_inpaint, edge_correction
 # jax version can not work, let's use numpy version
 from .ref.alpha_matte_np import closed_form_matte
 from .utils import COO_spsolve, binarize_img, normalize_img, spdiag
@@ -230,25 +231,23 @@ grad_operator = partial(sobel_cv2, norm=True)
 grad_kernel = 'sobel'
 
 
-def solve_images_jax(
-        J,
-        Wm,
-        alpha,
-        W_init,
-        #  EIk,
-        J_all=None,
-        est_Ik=None,
-        alpha_max=1,
-        gamma=1,
-        beta=1,
-        lambda_w=0.005,
-        lambda_i=1,
-        lambda_a=0.01,
-        iters=4,
-        decompose_iters=3,
-        alpha_inters=3,
-        n_jobs=4,
-        tol=0.05):
+def solve_images_jax(J,
+                     Wm,
+                     alpha,
+                     W_init,
+                     alpha_max=1,
+                     gamma=1,
+                     beta=1,
+                     lambda_w=0.005,
+                     lambda_i=1,
+                     lambda_a=0.01,
+                     iters=4,
+                     decompose_iters=3,
+                     alpha_inters=3,
+                     n_jobs=4,
+                     tol=0.05,
+                     step_3_update_alpha=False,
+                     step_4=True):
     '''
     gamma: phi_aux, Wk looks like W
     beta: phi_f, alpha W have similar gradient as Wm
@@ -260,13 +259,14 @@ def solve_images_jax(
     Step 1: Image Watermark decomposition
     '''
     # prepare variables
+
+    if (not step_4) and (not step_3_update_alpha):
+        print("Alpha should be updated in step 3 if step 4 is skipped")
+        print("Set `step_3_update_alpha = True` automatically")
+        step_3_update_alpha = True
+
     J = np.asarray(J)
     K, m, n, p = J.shape
-
-    if J_all is not None:
-        if est_Ik is None:
-            raise ValueError("If J_all is given, est_Ik should be given")
-        J_all = np.asarray(J_all)
 
     sobelx = kernel_to_matrix(m,
                               n,
@@ -308,32 +308,32 @@ def solve_images_jax(
             alpha)
 
         results = Parallel(n_jobs=n_jobs)(
-            delayed(decompose_wartermark_image)(J_i,
-                                                Wk_i,
-                                                Ik_i,
-                                                alpha,
-                                                alpha_gx,
-                                                alpha_gy,
-                                                alpha_diag,
-                                                alpha_bar_diag,
-                                                Wm,
-                                                Wm_gx,
-                                                Wm_gy,
-                                                W,
-                                                sobelx,
-                                                sobely,
-                                                cx,
-                                                cy,
-                                                gamma,
-                                                beta,
-                                                lambda_w,
-                                                lambda_i,
-                                                m,
-                                                n,
-                                                p,
-                                                decompose_iters,
-                                                verbose=False,
-                                                tol=tol)
+            delayed(decompose_watermark_image)(J_i,
+                                               Wk_i,
+                                               Ik_i,
+                                               alpha,
+                                               alpha_gx,
+                                               alpha_gy,
+                                               alpha_diag,
+                                               alpha_bar_diag,
+                                               Wm,
+                                               Wm_gx,
+                                               Wm_gy,
+                                               W,
+                                               sobelx,
+                                               sobely,
+                                               cx,
+                                               cy,
+                                               gamma,
+                                               beta,
+                                               lambda_w,
+                                               lambda_i,
+                                               m,
+                                               n,
+                                               p,
+                                               decompose_iters,
+                                               verbose=False,
+                                               tol=tol)
             for J_i, Wk_i, Ik_i in zip(J, Wk, Ik))
 
         for i, (Wk_i, Ik_i) in enumerate(results):
@@ -344,71 +344,100 @@ def solve_images_jax(
 
         # Step 2
         print("Step 2")
+
+        # Parallelize alpha_W_correction and edge_correction using joblib
+        def step2_wrapper(J_i, Wk_i, alpha):
+            I_corr, res_x = alpha_W_correction(J_i, Wk_i, alpha)
+            alpha_scaler = res_x[:3]
+            W_scaler = res_x[3:]
+            Ik_new = edge_correction(clean_inpaint(I_corr),
+                                     alpha).astype(np.float32)
+            Wk_new = Wk_i * W_scaler
+            return alpha_scaler, Ik_new, Wk_new
+
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(step2_wrapper)(J[i], Wk[i], alpha) for i in range(K))
+
+        alpha_scaler_lst = []
+        for i, (alpha_scaler, Ik_new, Wk_new) in enumerate(results):
+            alpha_scaler_lst.append(alpha_scaler)
+            Ik[i] = Ik_new
+            Wk[i] = Wk_new
+
+        print(np.median(alpha_scaler_lst, axis=0))
+
+        alpha = alpha * np.median(alpha_scaler_lst, axis=0)
         W = np.median(np.asarray(Wk), axis=0)
 
         # Step 3
         print("Step 3")
+        Wm_new, alpha_new = update_Wm_alpha(J, Ik, Wm, alpha, K, m, n, p)
+        print(np.linalg.norm(Wm_new - Wm))
+        Wm = Wm_new.copy()
 
-        step3_alpha_old = alpha.copy()
-        first_rdiff = None
-        if_converge = False
+        if step_3_update_alpha:
+            print(np.linalg.norm(alpha - alpha_new))
+            alpha = alpha_new
 
-        for j in range(alpha_inters):
+        if step_4:
+            # Step 4
+            print("Step 4")
 
-            alpha = update_alpha(
-                J=J,
-                Ik=Ik,
-                W=W,
-                Wm_gx=Wm_gx,
-                Wm_gy=Wm_gy,
-                Wm=Wm,
-                alpha=alpha,
-                #  alpha_gx_abs=alpha_gx_abs,
-                #  alpha_gy_abs=alpha_gy_abs,
-                sobelx=sobelx,
-                sobely=sobely,
-                beta=beta,
-                lambda_a=lambda_a,
-                K=K,
-                m=m,
-                n=n,
-                p=p,
-                alpha_max=alpha_max)
-
-            rdiff_alpha = np.linalg.norm(
-                alpha - step3_alpha_old) / np.linalg.norm(alpha)
-            # print(rdiff_alpha)
             step3_alpha_old = alpha.copy()
+            first_rdiff = None
+            if_converge = False
 
-            if first_rdiff is None:
-                first_rdiff = rdiff_alpha
-            else:
-                if rdiff_alpha < 0.5 * first_rdiff:
-                    if_converge = True
-                    print(f"alpha converge at {j+1}/{alpha_inters}")
-                    print(f"first_rdiff: {first_rdiff}")
-                    print(f"rdiff_alpha: {rdiff_alpha}")
-                    break
+            for j in range(alpha_inters):
 
-            # print(f"alpha_inters: {j+1}/{alpha_inters}")
+                alpha = update_alpha(
+                    J=J,
+                    Ik=Ik,
+                    W=W,
+                    Wm_gx=Wm_gx,
+                    Wm_gy=Wm_gy,
+                    Wm=Wm,
+                    alpha=alpha,
+                    #  alpha_gx_abs=alpha_gx_abs,
+                    #  alpha_gy_abs=alpha_gy_abs,
+                    sobelx=sobelx,
+                    sobely=sobely,
+                    beta=beta,
+                    lambda_a=lambda_a,
+                    K=K,
+                    m=m,
+                    n=n,
+                    p=p,
+                    alpha_max=alpha_max)
 
-        if not if_converge:
-            print("Warning: alpha not converge")
-            print(f"first_rdiff: {first_rdiff}")
-            print(f"rdiff_alpha: {rdiff_alpha}")  # type: ignore
+                rdiff_alpha = np.linalg.norm(
+                    alpha - step3_alpha_old) / np.linalg.norm(alpha)
+                # print(rdiff_alpha)
+                step3_alpha_old = alpha.copy()
 
-        print(np.linalg.norm(alpha - alpha_old))
-        alpha_old = alpha.copy()
+                if first_rdiff is None:
+                    first_rdiff = rdiff_alpha
+                else:
+                    if rdiff_alpha < 0.5 * first_rdiff + 1e-3:
+                        if_converge = True
+                        print(f"alpha converge at {j+1}/{alpha_inters}")
+                        print(f"first_rdiff: {first_rdiff}")
+                        print(f"rdiff_alpha: {rdiff_alpha}")
+                        break
 
-        # Wm = alpha * W
-        # print(np.linalg.norm(Wm - Wm_old))
-        # Wm_old = Wm.copy()
+                # print(f"alpha_inters: {j+1}/{alpha_inters}")
 
-        if J_all is not None:
-            residual = (np.median(np.asarray(J_all) - W * alpha, axis=0) /
-                        (1 - alpha) - est_Ik)
-            for i in range(K):
-                Ik[i] = Ik[i] - residual
+            if not if_converge:
+                print("Warning: alpha not converge")
+                print(f"first_rdiff: {first_rdiff}")
+                print(f"rdiff_alpha: {rdiff_alpha}")  # type: ignore
+
+            print(np.linalg.norm(alpha - alpha_old))
+            alpha_old = alpha.copy()
+
+            # Wm = alpha * W
+            # print(np.linalg.norm(Wm - Wm_old))
+            # Wm_old = Wm.copy()
+            
 
     return (Wk, Ik, W, alpha)
 
@@ -424,7 +453,18 @@ def just_decompose(J,
                    decompose_iters=3,
                    n_jobs=4,
                    verbose=False,
-                   tol=0.05):
+                   tol=0.05,
+                   I_ref=None,
+                   r_gamma_I=1,
+                   I_ref_weight='alpha_grad'):
+    '''
+    gamma: phi_aux, Wk looks like W
+    beta: phi_f, alpha W have similar gradient as Wm
+    lambda_w: W smoothness in large alpha gradient
+    lambda_i: I smoothness in large alpha gradient
+
+    W_init: Initial value of W
+    '''
 
     # prepare variables
     J = np.asarray(J)
@@ -458,32 +498,35 @@ def just_decompose(J,
         alpha)
 
     results = Parallel(n_jobs=n_jobs)(
-        delayed(decompose_wartermark_image)(J_i,
-                                            Wk_i,
-                                            Ik_i,
-                                            alpha,
-                                            alpha_gx,
-                                            alpha_gy,
-                                            alpha_diag,
-                                            alpha_bar_diag,
-                                            Wm,
-                                            Wm_gx,
-                                            Wm_gy,
-                                            W,
-                                            sobelx,
-                                            sobely,
-                                            cx,
-                                            cy,
-                                            gamma,
-                                            beta,
-                                            lambda_w,
-                                            lambda_i,
-                                            m,
-                                            n,
-                                            p,
-                                            decompose_iters,
-                                            verbose=verbose,
-                                            tol=tol)
+        delayed(decompose_watermark_image)(J_i,
+                                           Wk_i,
+                                           Ik_i,
+                                           alpha,
+                                           alpha_gx,
+                                           alpha_gy,
+                                           alpha_diag,
+                                           alpha_bar_diag,
+                                           Wm,
+                                           Wm_gx,
+                                           Wm_gy,
+                                           W,
+                                           sobelx,
+                                           sobely,
+                                           cx,
+                                           cy,
+                                           gamma,
+                                           beta,
+                                           lambda_w,
+                                           lambda_i,
+                                           m,
+                                           n,
+                                           p,
+                                           decompose_iters,
+                                           verbose=verbose,
+                                           tol=tol,
+                                           I_ref=I_ref,
+                                           r_gamma_I=r_gamma_I,
+                                           I_ref_weight=I_ref_weight)
         for J_i, Wk_i, Ik_i in zip(J, Wk, Ik))
 
     for i, (Wk_i, Ik_i) in enumerate(results):
@@ -576,6 +619,40 @@ def update_alpha(
     return alpha
 
 
+def update_Wm_alpha(J, Ik, Wm, alpha, K, m, n, p):
+
+    size = m * n * p
+
+    A_ul = diags((np.zeros((size))).flatten())
+    A_ur = diags((np.zeros((size))).flatten())
+    b_u = np.zeros((size))
+    A_ll = diags((np.zeros((size))).flatten())
+    A_lr = diags((np.zeros((size))).flatten())
+    b_l = np.zeros((size))
+
+    for i in range(K):
+
+        phi_data = func_phi_deriv((J[i] - Wm - (1 - alpha) * Ik[i])**2)
+
+        A_ul += diags((phi_data * Ik[i]).flatten())
+        A_ur += diags(-(phi_data * Ik[i] * Ik[i]).flatten())
+        b_u += (phi_data * Ik[i] * (J[i] - Ik[i])).flatten()
+
+        A_ll += diags((phi_data).flatten())
+        A_lr += diags(-(phi_data * Ik[i]).flatten())
+        b_l += (phi_data * (J[i] - Ik[i])).flatten()
+
+    A = sp_vstack([sp_hstack([A_ul, A_ur]), sp_hstack([A_ll, A_lr])]).tocsr()
+    b = np.hstack([b_u, b_l])
+
+    x = spsolve(A, b)
+
+    Wm_new = np.clip(x[:size].reshape(m, n, p), 0, 255)  # type: ignore
+    alpha_new = np.clip(x[size:].reshape(m, n, p), 0, 255)  # type: ignore
+
+    return Wm_new, alpha_new
+
+
 def func_phi(X, epsilon=1e-3):
     return np.sqrt(X + epsilon**2)
 
@@ -584,39 +661,42 @@ def func_phi_deriv(X, epsilon=1e-3):
     return 0.5 / func_phi(X, epsilon)
 
 
-def decompose_wartermark_image(J_i,
-                               Wk_i,
-                               Ik_i,
-                               alpha,
-                               alpha_gx,
-                               alpha_gy,
-                               alpha_diag,
-                               alpha_bar_diag,
-                               Wm,
-                               Wm_gx,
-                               Wm_gy,
-                               W,
-                               sobelx,
-                               sobely,
-                               cx,
-                               cy,
-                               gamma,
-                               beta,
-                               lambda_w,
-                               lambda_i,
-                               m,
-                               n,
-                               p,
-                               decompose_iters,
-                               tol=0.05,
-                               verbose=False):
+def decompose_watermark_image(J_i,
+                              Wk_i,
+                              Ik_i,
+                              alpha,
+                              alpha_gx,
+                              alpha_gy,
+                              alpha_diag,
+                              alpha_bar_diag,
+                              Wm,
+                              Wm_gx,
+                              Wm_gy,
+                              W,
+                              sobelx,
+                              sobely,
+                              cx,
+                              cy,
+                              gamma,
+                              beta,
+                              lambda_w,
+                              lambda_i,
+                              m,
+                              n,
+                              p,
+                              decompose_iters,
+                              tol=0.05,
+                              verbose=False,
+                              I_ref=None,
+                              r_gamma_I=1,
+                              I_ref_weight='alpha_grad'):
 
     Wk_old = Wk_i.copy()
     Ik_old = Ik_i.copy()
 
     for j in range(decompose_iters):
 
-        Wk_i, Ik_i = _decompose_wartermark_image_single(
+        Wk_i, Ik_i = _decompose_watermark_image_single(
             J_i=J_i,
             Wk_i=Wk_i,
             Ik_i=Ik_i,
@@ -639,7 +719,10 @@ def decompose_wartermark_image(J_i,
             lambda_i=lambda_i,
             m=m,
             n=n,
-            p=p)
+            p=p,
+            I_ref=I_ref,
+            r_gamma_I=r_gamma_I,
+            I_ref_weight=I_ref_weight)
 
         rdiff_Wk = np.linalg.norm(Wk_i - Wk_old) / np.linalg.norm(Wk_old)
         rdiff_Ik = np.linalg.norm(Ik_i - Ik_old) / np.linalg.norm(Ik_old)
@@ -667,11 +750,32 @@ def decompose_wartermark_image(J_i,
     return Wk_i, Ik_i
 
 
-def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx,
-                                       alpha_gy, alpha_diag, alpha_bar_diag,
-                                       Wm, Wm_gx, Wm_gy, W, sobelx, sobely, cx,
-                                       cy, gamma, beta, lambda_w, lambda_i, m,
-                                       n, p):
+def _decompose_watermark_image_single(J_i,
+                                      Wk_i,
+                                      Ik_i,
+                                      alpha,
+                                      alpha_gx,
+                                      alpha_gy,
+                                      alpha_diag,
+                                      alpha_bar_diag,
+                                      Wm,
+                                      Wm_gx,
+                                      Wm_gy,
+                                      W,
+                                      sobelx,
+                                      sobely,
+                                      cx,
+                                      cy,
+                                      gamma,
+                                      beta,
+                                      lambda_w,
+                                      lambda_i,
+                                      m,
+                                      n,
+                                      p,
+                                      I_ref=None,
+                                      r_gamma_I=1,
+                                      I_ref_weight='alpha_grad'):
 
     size = m * n * p
 
@@ -715,12 +819,36 @@ def _decompose_wartermark_image_single(J_i, Wk_i, Ik_i, alpha, alpha_gx,
     A_ul = (alpha_diag**
             2) * phi_data + gamma * phi_aux - lambda_w * L_w - beta * A_f
 
+    if I_ref is not None:
+
+        if I_ref_weight == 'alpha_grad':
+            scaler = np.sqrt(alpha_gx_abs**2 + alpha_gy_abs**2)
+        elif I_ref_weight == 'alpha_non_zero':
+            scaler = (alpha > 0).astype(np.float32)
+        elif I_ref_weight == 'same':
+            scaler = np.ones_like(alpha_gx_abs)
+        else:
+            raise ValueError(f"Unknown I_ref_weight: {I_ref_weight}")
+        phi_I = diags(
+            func_phi_deriv((np.square(Ik_i - I_ref) * scaler).flatten()))
+
+        K_scaler = diags(scaler.flatten()) @ phi_I
+
+        A_lr = (alpha_bar_diag**
+                2) * phi_data - lambda_i * L_i + gamma * r_gamma_I * K_scaler
+
+        bI = alpha_bar_diag @ (phi_data) @ (
+            J_i.flatten()) + gamma * r_gamma_I * K_scaler @ (I_ref.flatten())
+    else:
+        A_lr = (alpha_bar_diag**2) * phi_data - lambda_i * L_i
+
+        bI = alpha_bar_diag @ (phi_data) @ (J_i.flatten())
+
     A = sp_vstack([sp_hstack([A_ul, alpha_diag*alpha_bar_diag*phi_data]), \
-                    sp_hstack([alpha_diag*alpha_bar_diag*phi_data, (alpha_bar_diag**2)*phi_data - lambda_i*L_i])]).tocsr()
+                    sp_hstack([alpha_diag*alpha_bar_diag*phi_data, A_lr])]).tocsr()
 
     bW = alpha_diag @ (phi_data) @ (J_i.flatten()) + gamma * phi_aux @ (
         W.flatten()) - beta * (K_fx @ sobelx + K_fy @ sobely) @ (Wm.flatten())
-    bI = alpha_bar_diag @ (phi_data) @ (J_i.flatten())
 
     b = np.hstack([bW, bI])
     # return A, b
