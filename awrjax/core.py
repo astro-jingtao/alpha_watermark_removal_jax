@@ -243,10 +243,13 @@ def solve_images_jax(J,
                      lambda_a=0.01,
                      iters=4,
                      decompose_iters=3,
+                     Wm_iters=20,
                      alpha_inters=3,
                      n_jobs=4,
                      tol=0.05,
+                     Wm_new_tol=1e-3,
                      step_3_update_alpha=False,
+                     step_3_update_W=False,
                      step_4=True):
     '''
     gamma: phi_aux, Wk looks like W
@@ -371,13 +374,35 @@ def solve_images_jax(J,
 
         # Step 3
         print("Step 3")
-        Wm_new, alpha_new = update_Wm_alpha(J, Ik, Wm, alpha, K, m, n, p)
-        print(np.linalg.norm(Wm_new - Wm))
-        Wm = Wm_new.copy()
+        alpha_step3 = alpha.copy()
+        is_step3_converge = False
+        for j in range(Wm_iters):
+            Wm_new, alpha_new = update_Wm_alpha(J, Ik, Wm, alpha_step3, K, m,
+                                                n, p)
+            Wm_rdiff = np.linalg.norm(Wm_new - Wm) / np.linalg.norm(Wm)
+            alpha_rdiff = np.linalg.norm(
+                alpha_new - alpha_step3) / np.linalg.norm(alpha_step3)
+            Wm = Wm_new
+            alpha_step3 = alpha_new
 
+            if Wm_rdiff < Wm_new_tol:
+                is_step3_converge = True
+                break
+
+        if is_step3_converge:
+            print(f"Wm converge at {j+1}/{Wm_iters}")
+        else:
+            print(f"Warning: Wm not converge with {Wm_iters} iterations")
+
+        print(f"Wm_rdiff last iteration: {Wm_rdiff}")  # type: ignore
         if step_3_update_alpha:
-            print(np.linalg.norm(alpha - alpha_new))
-            alpha = alpha_new
+            alpha = alpha_step3
+            print(f"alpha_rdiff last iteration: {alpha_rdiff}")  # type: ignore
+
+        if step_3_update_W:
+            W = np.zeros_like(Wm)
+            alpha_nonzero = ~(alpha == 0)
+            W[alpha_nonzero] = Wm[alpha_nonzero] / alpha[alpha_nonzero]
 
         if step_4:
             # Step 4
@@ -437,7 +462,6 @@ def solve_images_jax(J,
             # Wm = alpha * W
             # print(np.linalg.norm(Wm - Wm_old))
             # Wm_old = Wm.copy()
-            
 
     return (Wk, Ik, W, alpha)
 
