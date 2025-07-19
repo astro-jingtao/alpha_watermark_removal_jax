@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from awrjax.jaxcv.filter import gaussian, sobel
+from awrjax.jaxcv.filter import gaussian, sobel, sobel_cv2
 
 np.random.seed(1997)
 
@@ -37,10 +37,19 @@ class TestFilter:
         img = np.random.randint(0, 256, size=(100, 100, 3), dtype=np.uint8)
         img_jax = jnp.array(img, dtype=jnp.float32)
 
-        img_sobel_x_cv2 = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
-        img_sobel_y_cv2 = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+        img_sobel_x_cv2_raw = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+        img_sobel_y_cv2_raw= cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+
+
         img_sobel_x_jax = sobel(img_jax, 'x')
         img_sobel_y_jax = sobel(img_jax, 'y')
+        assert jnp.allclose(img_sobel_x_cv2_raw, img_sobel_x_jax)
+        assert jnp.allclose(img_sobel_y_cv2_raw, img_sobel_y_jax)
 
-        assert jnp.allclose(img_sobel_x_cv2, img_sobel_x_jax)
-        assert jnp.allclose(img_sobel_y_cv2, img_sobel_y_jax)
+
+        img_sobel_x_cv2 = sobel_cv2(img.astype(np.float32), 'x')
+        img_sobel_y_cv2 = sobel_cv2(img.astype(np.float32), 'y')
+        assert jnp.allclose(img_sobel_x_cv2_raw, img_sobel_x_cv2)
+        assert jnp.allclose(img_sobel_y_cv2_raw, img_sobel_y_cv2)
+
+    

@@ -1,7 +1,11 @@
+import cv2
 import jax.numpy as jnp
-from jax.scipy.signal import convolve
+import numpy as np
 from jax import vmap
-from .kernel import gaussian_kernel, sobel_kernel, grad_kernel
+from jax.scipy.signal import convolve
+from poissonpy.functional import get_np_gradient
+
+from .kernel import gaussian_kernel, grad_kernel, sobel_kernel
 
 
 def convolve_with_kernel(image, kernel, boundary='reflect', method='auto'):
@@ -40,102 +44,53 @@ def sobel(image, axis, boundary='reflect'):
     return convolve_with_kernel(image, sobel_kernel(axis), boundary=boundary)
 
 
+def sobel_cv2(image, axis, norm=False):
+    original_dtype = image.dtype
+    image = image.astype(np.float32)
+
+    if norm:
+        scaler = 1/8
+    else:
+        scaler = 1
+
+    if axis in (0, 'y', 'i'):
+        return cv2.Sobel(image, cv2.CV_32F, 0, 1,
+                         ksize=3).astype(original_dtype) * scaler
+    elif axis in (1, 'x', 'j'):
+        return cv2.Sobel(image, cv2.CV_32F, 1, 0,
+                         ksize=3).astype(original_dtype) * scaler
+    else:
+        raise ValueError('Invalid axis')
+
+
 def grad(image, axis, boundary='reflect'):
     return convolve_with_kernel(image, grad_kernel(axis), boundary=boundary)
 
 
-# def canny(img, low_thresh=50, high_thresh=100, sigma=1.0):
-#     # https://docs.opencv.org/4.x/da/d22/tutorial_py_canny.html
-#     img = rgb2gray(img)
-#     img = gaussian(img, sigma, 5)
+def grad_np(image, axis, mode='center', boundary='reflect'):
 
-#     magnitude, direction = gradient_magnitude_direction(img)
+    _pad_width = ((1, 1), (1, 1))
+    if len(image.shape) == 3:
+        batch = True
+        _pad_width += ((0, 0), )
+    else:
+        batch = False
 
-#     print('non-maximum suppression')
-#     nms = non_maximum_suppression(magnitude, direction)
+    if mode == 'center':
 
-#     print('double threshold')
-#     strong, weak = double_threshold(nms, low_thresh, high_thresh)
+        image_padded = np.pad(image, pad_width=_pad_width, mode=boundary) # type: ignore
 
-#     print('edge tracking by hysteresis')
-#     edges = edge_tracking_by_hysteresis(strong, weak)
-#     return edges.astype(jnp.float32)
+        if axis in (0, 'y', 'i'):
+            return (image_padded[2:, :, :] - image_padded[:-2, :, :])[:, 1:-1, :]
+        elif axis in (1, 'x', 'j'):
+            return (image_padded[:, 2:, :] - image_padded[:, :-2, :])[1:-1, :, :]
+        else:
+            raise ValueError('Invalid axis')
 
-# def rgb2gray(img):
-#     return jnp.dot(img[..., :3], jnp.array([0.2989, 0.5870, 0.1140]))
-
-# def gradient_magnitude_direction(img):
-#     Gx = sobel(img, axis='x')
-#     Gy = sobel(img, axis='y')
-#     magnitude = jnp.sqrt(jnp.square(Gx) + jnp.square(Gy))
-#     direction = jnp.arctan2(Gy, Gx)
-#     return magnitude, direction
-
-# def non_maximum_suppression(magnitude, direction):
-#     H, W = magnitude.shape
-#     direction = jnp.rad2deg(direction) % 180
-
-#     def suppress_pixel(i, j):
-#         angle = direction[i, j]
-#         m = magnitude[i, j]
-
-#         cond1 = ((0 <= angle) & (angle < 22.5)) | ((157.5 <= angle) &
-#                                                    (angle < 180))
-
-#         before, after = jnp.where(
-#             cond1,
-#             x=jnp.array((magnitude[i, j - 1], magnitude[i, j + 1])),
-#             y=jnp.where(
-#                 (22.5 <= angle) & (angle < 67.5),
-#                 jnp.array((magnitude[i - 1, j + 1], magnitude[i + 1, j - 1])),
-#                 jnp.where(
-#                     (67.5 <= angle) & (angle < 112.5),
-#                     jnp.array((magnitude[i - 1, j], magnitude[i + 1, j])),
-#                     jnp.array(
-#                         (magnitude[i - 1,
-#                                    j - 1], magnitude[i + 1,
-#                                                      j + 1]))  # else condition
-#                 )))
-
-#         return jnp.where((m >= before) & (m >= after), m, 0.0)
-
-#     # Vectorized over image except borders
-#     vmapped_suppress = vmap(vmap(suppress_pixel, in_axes=(0, None)),
-#                             in_axes=(None, 0))
-
-#     result = vmapped_suppress(jnp.arange(1, H - 1), jnp.arange(1, W - 1))
-
-#     return jnp.pad(result, pad_width=1, mode='constant', constant_values=0)
-
-# def double_threshold(img, low_thresh, high_thresh):
-#     strong = img > high_thresh
-#     weak = (img >= low_thresh) & ~strong
-#     return strong, weak
-
-# def edge_tracking_by_hysteresis(strong, weak):
-#     H, W = strong.shape
-#     edges = strong.copy()
-
-#     def grow(i, j):
-#         if not weak[i, j]:
-#             return False
-#         for di in [-1, 0, 1]:
-#             for dj in [-1, 0, 1]:
-#                 if di == 0 and dj == 0:
-#                     continue
-#                 if edges[i + di, j + dj]:
-#                     return True
-#         return False
-
-#     changed = True
-#     while changed:
-#         changed = False
-#         new_edges = edges.copy()
-#         for i in range(1, H - 1):
-#             for j in range(1, W - 1):
-#                 if weak[i, j] and grow(i, j):
-#                     new_edges = new_edges.at[i, j].set(True)
-#                     changed = True
-#         edges = new_edges
-
-#     return edges
+    elif mode in ['forward', 'backward']:
+        forward = True if mode == 'forward' else False
+        gx, gy = get_np_gradient(image, forward=forward, batch=batch, padding=True)
+        if axis in (0, 'y', 'i'):
+            return gy
+        elif axis in (1, 'x', 'j'):
+            return gx
